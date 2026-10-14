@@ -1,5 +1,5 @@
 /**
- * Client half of the `@local/dsh-fork-worktree` bundle.
+ * Client half of the `@bainianzzz/dsh-fork-worktree` bundle.
  *
  * Two buttons on every *Workspace* row of the sidebar's workspace browser — fork
  * (create a worktree of that Workspace's repository and register it) and trash
@@ -27,7 +27,7 @@
  * the `--dsw-*` tokens.
  */
 window.__ModuleLoader__.load({
-	id: '@local/dsh-fork-worktree',
+	id: '@bainianzzz/dsh-fork-worktree',
 	factory(require) {
 		const React = require('react');
 		const ReactDOM = require('react-dom');

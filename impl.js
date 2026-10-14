@@ -1,5 +1,5 @@
 /**
- * Host half of the `@local/dsh-fork-worktree` bundle.
+ * Host half of the `@bainianzzz/dsh-fork-worktree` bundle.
  *
  * One operation, three entry points that all call {@link createWorktreeFork}:
  * the Client button POSTs to the fork route below, and a human can type the
@@ -23,7 +23,7 @@
  * a removed fork when the name says so (a generated label, or an explicit label
  * beside its repository), so a restart does not strand the row either.
  *
- * @module @local/dsh-fork-worktree
+ * @module @bainianzzz/dsh-fork-worktree
  */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
