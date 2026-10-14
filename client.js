@@ -1,26 +1,30 @@
 /**
  * Client half of the `@local/dsh-fork-worktree` bundle.
  *
- * A fork button on every *Workspace* row of the sidebar's workspace browser,
- * one confirmation dialog, and one toast.
+ * Two buttons on every *Workspace* row of the sidebar's workspace browser — fork
+ * (create a worktree of that Workspace's repository and register it) and trash
+ * (delete that Workspace's directory and drop its registration) — plus one
+ * dialog and one toast.
  *
  * The workspace row is not a slot host: DSH renders its "…" menu and its "+"
  * new-session button as private row chrome with no extension point, so this
- * bundle mounts the button into that row's action strip through a React portal
+ * bundle mounts its buttons into that row's action strip through a React portal
  * and re-scans on DOM mutations. The strip is the last element child of the row
- * carrying `data-row-key="workspace:<id>"`, and the button is inserted directly
- * before the "+" — the host hides the whole strip until the row is hovered, so
- * the button inherits that behavior.
+ * carrying `data-row-key="workspace:<id>"`, the buttons are inserted directly
+ * before the "+", and the host hides the whole strip until the row is hovered,
+ * so the buttons inherit that behavior.
  *
- * Nothing is created on a click: the button only opens the dialog. Confirming
- * posts the Workspace's directory to the Host route, which creates the worktree
- * and registers the Workspace, and this half then adopts that Workspace into the
- * Client model and opens a Session in it. A directory that is not a repository
- * answers with `not-a-git-repo`, and the same dialog reopens in its initialize
- * mode instead of reporting a failure.
+ * No click ever acts: each one opens the dialog first. Confirming the fork posts
+ * the Workspace's directory to the fork route, which creates the worktree and
+ * registers the Workspace; this half then adopts that Workspace into the Client
+ * model and opens a Session in it. Confirming the removal posts to the remove
+ * route; a worktree that still holds uncommitted content answers
+ * `worktree-dirty`, and the dialog reopens in its force mode instead of
+ * discarding work.
  *
  * Controls are hand-written against theme tokens; the markup and CSS follow the
- * host's `iconButton`, `Modal`, and `Toast` and share only the `--dsw-*` tokens.
+ * host's `iconButton`, `Modal`, `Toast`, and destructive `Button` and share only
+ * the `--dsw-*` tokens.
  */
 window.__ModuleLoader__.load({
 	id: '@local/dsh-fork-worktree',
@@ -33,8 +37,9 @@ window.__ModuleLoader__.load({
 		/** Dictionary namespace owned by this plugin. */
 		const NS = 'fork-worktree';
 
-		/** Host route, relative so a mount prefix keeps working. */
-		const ROUTE = 'dsh-fork-worktree/fork';
+		/** Host routes, relative so a mount prefix keeps working. */
+		const FORK_ROUTE = 'dsh-fork-worktree/fork';
+		const REMOVE_ROUTE = 'dsh-fork-worktree/remove';
 
 		/** Workspace rows carry this prefix in `data-row-key`. */
 		const ROW_SELECTOR = '[data-row-key^="workspace:"]';
@@ -48,14 +53,18 @@ window.__ModuleLoader__.load({
 		/** How long a toast stays before it dismisses itself, matching the host's banner. */
 		const TOAST_HOLD_MS = 3200;
 
-		/** Dialog modes: plain confirmation, and the retry that initializes first. */
+		/** Dialog modes: confirmations, and the two questions that follow a refusal. */
 		const CONFIRM = 'confirm';
 		const INITIALIZE = 'initialize';
+		const REMOVE = 'remove';
+		const REMOVE_FORCE = 'remove-force';
+
+		/** Which operation a toast reports. */
+		const FORK = 'fork';
 
 		const zh = {
 			'action.fork': '用新 worktree 创建工作区',
-			'action.forkFailed': '创建 worktree 失败：{message}',
-			'action.forked': '已创建 worktree 工作区：{path}',
+			'action.remove': '删除工作区文件夹',
 			'confirm.title': '新建 worktree 工作区',
 			'confirm.desc': '将基于 {path} 所在的仓库创建一个新的 git worktree，并把该 worktree 注册为一个新的 dsh 工作区。',
 			'confirm.action': '创建 worktree',
@@ -64,12 +73,23 @@ window.__ModuleLoader__.load({
 			'init.desc': '无法为 {path} 创建 worktree。可以先用 git init 把它初始化为仓库（把该目录当前的内容提交为第一个提交），再创建 worktree。',
 			'init.action': '初始化并创建 worktree',
 			'init.busy': '正在初始化并创建 worktree…',
+			'remove.title': '删除工作区文件夹',
+			'remove.desc': '将删除文件夹 {path} 及其全部内容，并移除该工作区的登记。会话记录会保留，删除的内容无法恢复。',
+			'remove.action': '删除文件夹',
+			'remove.busy': '正在删除…',
+			'removeForce.title': '文件夹里有未提交的内容',
+			'removeForce.desc': '{path} 里有未提交的修改或未跟踪文件，普通删除会被 git 拒绝。强制删除会把这些内容一并丢弃。',
+			'removeForce.action': '强制删除',
+			'removeForce.busy': '正在强制删除…',
 			'cancel': '取消',
+			'toast.forked': '已创建 worktree 工作区：{path}',
+			'toast.forkFailed': '创建 worktree 失败：{message}',
+			'toast.removed': '已删除工作区文件夹：{path}',
+			'toast.removeFailed': '删除失败：{message}',
 		};
 		const en = {
 			'action.fork': 'Create a workspace on a new worktree',
-			'action.forkFailed': 'Creating the worktree failed: {message}',
-			'action.forked': 'Created a worktree workspace: {path}',
+			'action.remove': 'Delete the workspace folder',
 			'confirm.title': 'New worktree workspace',
 			'confirm.desc': 'A new git worktree will be created from the repository that owns {path}, and that worktree will be registered as a new dsh workspace.',
 			'confirm.action': 'Create worktree',
@@ -78,11 +98,23 @@ window.__ModuleLoader__.load({
 			'init.desc': "No worktree can be created for {path} yet. Initialize it as a repository first (git init, committing the directory's current content as its first commit), then create the worktree.",
 			'init.action': 'Initialize and create worktree',
 			'init.busy': 'Initializing and creating the worktree…',
+			'remove.title': 'Delete the workspace folder',
+			'remove.desc': 'The folder {path} and everything inside it will be deleted, and the workspace registration will be dropped. Session logs are kept; deleted content cannot be recovered.',
+			'remove.action': 'Delete folder',
+			'remove.busy': 'Deleting…',
+			'removeForce.title': 'The folder holds uncommitted content',
+			'removeForce.desc': '{path} contains modified or untracked files, so git refuses an ordinary removal. A forced removal discards that content with the folder.',
+			'removeForce.action': 'Delete anyway',
+			'removeForce.busy': 'Deleting anyway…',
 			'cancel': 'Cancel',
+			'toast.forked': 'Created a worktree workspace: {path}',
+			'toast.forkFailed': 'Creating the worktree failed: {message}',
+			'toast.removed': 'Deleted the workspace folder: {path}',
+			'toast.removeFailed': 'Deleting the folder failed: {message}',
 		};
 
 		const css = `
-.dshForkWtContainer{display:inline-flex;align-items:center;flex:none}
+.dshForkWtContainer{display:inline-flex;align-items:center;gap:10px;flex:none}
 .dshForkWtButton{display:inline-flex;align-items:center;justify-content:center;flex:none;width:16px;height:16px;padding:0;border:none;border-radius:var(--dsw-radius-xs);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}
 .dshForkWtButton:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
 .dshForkWtButton:disabled{opacity:.5;cursor:default}
@@ -92,7 +124,6 @@ window.__ModuleLoader__.load({
 .dshForkWtDialog:focus{outline:none}
 .dshForkWtTitle{margin:0;font-size:16px;line-height:24px;font-weight:500}
 .dshForkWtDesc{margin:0;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
-.dshForkWtPath{color:var(--dsw-alias-label-primary)}
 .dshForkWtStatus{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
 .dshForkWtActions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
 .dshForkWtAction{box-sizing:border-box;height:36px;padding:0 14px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:14px;line-height:22px;cursor:pointer}
@@ -100,6 +131,7 @@ window.__ModuleLoader__.load({
 .dshForkWtAction:disabled{cursor:not-allowed;opacity:.4}
 .dshForkWtActionPrimary{border-color:transparent;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
 .dshForkWtActionPrimary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
+.dshForkWtActionDanger:not(:disabled){color:var(--dsw-alias-state-error-primary)}
 .dshForkWtToast{position:fixed;top:40px;left:50%;z-index:1100;display:flex;align-items:center;gap:10px;width:max-content;max-width:min(640px,calc(100vw - 48px));padding:12px 16px;border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-toast-bg);color:var(--dsw-alias-toast-label);font-size:14px;line-height:22px;pointer-events:none;transform:translateX(-50%)}
 .dshForkWtDot{flex:none;width:8px;height:8px;border-radius:50%}
 .dshForkWtDotOk{background:var(--dsw-alias-state-success-primary)}
@@ -132,55 +164,107 @@ window.__ModuleLoader__.load({
 			};
 		}
 
-		/** Git-branch glyph, drawn inline: the bundle imports no host icon package. */
-		function BranchIcon() {
+		/**
+		 * Fork glyph: the geometry of Lucide's `git-fork` (Lucide v1.57.0, ISC),
+		 * inlined because this bundle imports no icon package. Lucide's own
+		 * presentation attributes are kept — 24-unit viewBox, `currentColor`,
+		 * round caps and joins, 2-unit stroke.
+		 */
+		function ForkIcon() {
 			return h(
 				'svg',
 				{
-					viewBox: '0 0 16 16',
-					width: 14,
-					height: 14,
+					viewBox: '0 0 24 24',
+					width: 16,
+					height: 16,
 					fill: 'none',
 					stroke: 'currentColor',
-					strokeWidth: 1.4,
+					strokeWidth: 2,
 					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
 					'aria-hidden': true,
 				},
-				h('circle', { cx: 4, cy: 3.6, r: 1.6 }),
-				h('circle', { cx: 12, cy: 3.6, r: 1.6 }),
-				h('circle', { cx: 8, cy: 12.4, r: 1.6 }),
-				h('path', { d: 'M4 5.2v1.6c0 1.2 1 2.2 2.2 2.2h3.6c1.2 0 2.2-1 2.2-2.2V5.2' }),
-				h('path', { d: 'M8 9v1.8' }),
+				h('circle', { cx: 12, cy: 18, r: 3 }),
+				h('circle', { cx: 6, cy: 6, r: 3 }),
+				h('circle', { cx: 18, cy: 6, r: 3 }),
+				h('path', { d: 'M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9' }),
+				h('path', { d: 'M12 12v3' }),
 			);
 		}
 
-		/** One Workspace row's button, portalled into that row's action strip. */
+		/**
+		 * Trash glyph: the geometry of Lucide's `trash` (Lucide v0.400.0, ISC) —
+		 * lid, body and handle, without the two interior slats that `trash-2`
+		 * adds. Lucide v1.57.0 gives both names the same paths, and at 16px those
+		 * slats sit about a pixel apart and make the can read heavier than the
+		 * fork beside it, so this is the slat-free can.
+		 *
+		 * Its stroke is 1.8 rather than Lucide's 2: one glyph is drawn from
+		 * curves and the other from straight lines, and at 16px the straight
+		 * horizontals survive antialiasing better, so an equal declared width
+		 * still renders as different weight. Both land at about 1.2px.
+		 */
+		function TrashIcon() {
+			return h(
+				'svg',
+				{
+					viewBox: '0 0 24 24',
+					width: 16,
+					height: 16,
+					fill: 'none',
+					stroke: 'currentColor',
+					strokeWidth: 1.8,
+					strokeLinecap: 'round',
+					strokeLinejoin: 'round',
+					'aria-hidden': true,
+				},
+				h('path', { d: 'M3 6h18' }),
+				h('path', { d: 'M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6' }),
+				h('path', { d: 'M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2' }),
+			);
+		}
+
+		/** One row icon button, shared by both actions. */
+		function RowIconButton({ label, onClick, children }) {
+			return h(
+				'button',
+				{
+					type: 'button',
+					className: 'dshForkWtButton',
+					'aria-label': label,
+					title: label,
+					onClick: (event) => {
+						event.stopPropagation();
+						onClick();
+					},
+				},
+				children,
+			);
+		}
+
+		/** Fork button of one Workspace row, portalled into that row's action strip. */
 		function WorkspaceForkButton({ workspaceId, forkWorkspace, t }) {
 			const label = t('action.fork');
-			return h('button', {
-				type: 'button',
-				className: 'dshForkWtButton',
-				'aria-label': label,
-				title: label,
-				onClick: (event) => {
-					event.stopPropagation();
-					forkWorkspace(workspaceId);
-				},
-				children: h(BranchIcon),
-			});
+			return h(RowIconButton, { label, onClick: () => forkWorkspace(workspaceId) }, h(ForkIcon));
+		}
+
+		/** Trash button of one Workspace row, to the right of the fork button. */
+		function WorkspaceRemoveButton({ workspaceId, removeWorkspace, t }) {
+			const label = t('action.remove');
+			return h(RowIconButton, { label, onClick: () => removeWorkspace(workspaceId) }, h(TrashIcon));
 		}
 
 		/**
-		 * The `shell.overlay` entry that keeps one button mounted in every
+		 * The `shell.overlay` entry that keeps both buttons mounted in every
 		 * Workspace row.
 		 *
 		 * It watches the sidebar's own slot outlet (`data-slot`, the renderer's
 		 * stable anchor) rather than the whole frame, so a streaming Conversation
 		 * elsewhere in the frame costs no scans, and it re-uses the container it
-		 * already injected, so a re-render of the row neither duplicates the button
-		 * nor loses it.
+		 * already injected, so a re-render of the row neither duplicates the
+		 * buttons nor loses them.
 		 */
-		function WorkspaceForkHost({ forkWorkspace, t }) {
+		function WorkspaceRowActions({ forkWorkspace, removeWorkspace, t }) {
 			const [targets, setTargets] = React.useState([]);
 			React.useEffect(() => {
 				let frame = 0;
@@ -249,7 +333,12 @@ window.__ModuleLoader__.load({
 					? null
 					: targets.map((target) =>
 							createPortal(
-								h(WorkspaceForkButton, { workspaceId: target.workspaceId, forkWorkspace, t }),
+								h(
+									React.Fragment,
+									null,
+									h(WorkspaceForkButton, { workspaceId: target.workspaceId, forkWorkspace, t }),
+									h(WorkspaceRemoveButton, { workspaceId: target.workspaceId, removeWorkspace, t }),
+								),
 								target.container,
 								target.workspaceId,
 							),
@@ -257,21 +346,35 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** The one dialog: confirmation first, and initialization only after a refusal. */
-		function ForkWorktreeDialog({ useForkWorktreeRequest, settleForkWorktree, confirmForkWorktree, t }) {
-			const request = useForkWorktreeRequest((pending) => pending);
+		/** The one dialog: a confirmation, and the follow-up question after a refusal. */
+		function WorkspaceActionDialog({ useWorkspaceRequest, settleWorkspaceRequest, confirmWorkspaceRequest, t }) {
+			const request = useWorkspaceRequest((pending) => pending);
 			if (request === null) return null;
-			return h(ForkWorktreeDialogBody, {
+			return h(WorkspaceActionDialogBody, {
 				key: request.workspaceId,
 				request,
-				settle: settleForkWorktree,
-				confirm: confirmForkWorktree,
+				settle: settleWorkspaceRequest,
+				confirm: confirmWorkspaceRequest,
 				t,
 			});
 		}
 
+		/** Prefix of the dictionary keys driving one mode, and whether it destroys. */
+		function modePresentation(mode) {
+			switch (mode) {
+				case INITIALIZE:
+					return { prefix: 'init', danger: false };
+				case REMOVE:
+					return { prefix: 'remove', danger: true };
+				case REMOVE_FORCE:
+					return { prefix: 'removeForce', danger: true };
+				default:
+					return { prefix: 'confirm', danger: false };
+			}
+		}
+
 		/** One pending request's dialog; its in-flight state dies with it. */
-		function ForkWorktreeDialogBody({ request, settle, confirm, t }) {
+		function WorkspaceActionDialogBody({ request, settle, confirm, t }) {
 			const [busy, setBusy] = React.useState(false);
 			const primary = React.useRef(null);
 			React.useEffect(() => {
@@ -284,8 +387,7 @@ window.__ModuleLoader__.load({
 				window.addEventListener('keydown', onKeyDown);
 				return () => window.removeEventListener('keydown', onKeyDown);
 			}, [busy, settle]);
-			const initialize = request.mode === INITIALIZE;
-			const prefix = initialize ? 'init' : 'confirm';
+			const { prefix, danger } = modePresentation(request.mode);
 			return h(
 				'div',
 				{ className: 'dshForkWtMask' },
@@ -322,7 +424,7 @@ window.__ModuleLoader__.load({
 							{
 								type: 'button',
 								ref: primary,
-								className: 'dshForkWtAction dshForkWtActionPrimary',
+								className: `dshForkWtAction ${danger ? 'dshForkWtActionDanger' : 'dshForkWtActionPrimary'}`,
 								disabled: busy,
 								onClick: () => {
 									setBusy(true);
@@ -337,14 +439,15 @@ window.__ModuleLoader__.load({
 		}
 
 		/** The outcome banner for one finished attempt. */
-		function ForkWorktreeToast({ useForkWorktreeToast, dismissForkWorktreeToast, t }) {
-			const toast = useForkWorktreeToast((pending) => pending);
+		function WorkspaceActionToast({ useWorkspaceToast, dismissWorkspaceToast, t }) {
+			const toast = useWorkspaceToast((pending) => pending);
 			React.useEffect(() => {
 				if (toast === null) return undefined;
-				const timer = setTimeout(dismissForkWorktreeToast, TOAST_HOLD_MS);
+				const timer = setTimeout(dismissWorkspaceToast, TOAST_HOLD_MS);
 				return () => clearTimeout(timer);
 			}, [toast === null ? 0 : toast.seq]);
 			if (toast === null) return null;
+			const removed = toast.action !== FORK;
 			return h(
 				React.Fragment,
 				null,
@@ -359,8 +462,8 @@ window.__ModuleLoader__.load({
 						'span',
 						{ className: 'dshForkWtToastText' },
 						toast.kind === 'ok'
-							? t('action.forked', { path: toast.path })
-							: t('action.forkFailed', { message: toast.message }),
+							? t(removed ? 'toast.removed' : 'toast.forked', { path: toast.path })
+							: t(removed ? 'toast.removeFailed' : 'toast.forkFailed', { message: toast.message }),
 					),
 				),
 			);
@@ -370,7 +473,7 @@ window.__ModuleLoader__.load({
 		const inject = ['slots', 'locale', 'workspaces', 'uiWorkspace'];
 
 		/**
-		 * Register the Workspace-row button, the dialog, and the toast.
+		 * Register the Workspace-row buttons, the dialog, and the toast.
 		 * @param ctx - Client root context.
 		 */
 		function apply(ctx) {
@@ -381,8 +484,8 @@ window.__ModuleLoader__.load({
 				toastSeq += 1;
 				toast.set({ ...value, seq: toastSeq });
 			};
-			const report = (error) => {
-				notify({ kind: 'error', message: error instanceof Error ? error.message : String(error) });
+			const report = (action) => (error) => {
+				notify({ kind: 'error', action, message: error instanceof Error ? error.message : String(error) });
 			};
 
 			/** The Workspace's directory, read from the Client's live projection. */
@@ -391,38 +494,31 @@ window.__ModuleLoader__.load({
 				return items.find((item) => item.workspaceId === workspaceId)?.path;
 			};
 
+			/** Post one route request and answer its structured outcome. */
+			const post = async (route, body) => {
+				const response = await fetch(route, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(body),
+				});
+				if (!response.ok) return { failure: `HTTP ${response.status}` };
+				return { outcome: await response.json() };
+			};
+
 			/**
-			 * Post one fork request and act on its structured outcome.
+			 * Create the worktree workspace for one Workspace row.
 			 * @returns `'dialog'` when the caller must keep the dialog open in its
-			 * initialize mode, `'settled'` when the outcome was reported and the
-			 * dialog may close.
+			 * initialize mode, `'settled'` when the outcome was reported.
 			 */
 			const fork = async (workspaceId, options) => {
 				const source = pathOf(workspaceId);
 				if (source === undefined) {
-					notify({ kind: 'error', message: `unknown workspace ${workspaceId}` });
+					notify({ kind: 'error', action: FORK, message: `unknown workspace ${workspaceId}` });
 					return 'settled';
 				}
-				let response;
-				try {
-					response = await fetch(ROUTE, {
-						method: 'POST',
-						headers: { 'content-type': 'application/json' },
-						body: JSON.stringify({ source, init: options.init === true }),
-					});
-				} catch (error) {
-					report(error);
-					return 'settled';
-				}
-				if (!response.ok) {
-					notify({ kind: 'error', message: `fork route failed: HTTP ${response.status}` });
-					return 'settled';
-				}
-				let outcome;
-				try {
-					outcome = await response.json();
-				} catch (error) {
-					report(error);
+				const { outcome, failure } = await post(FORK_ROUTE, { source, init: options.init === true });
+				if (failure !== undefined) {
+					notify({ kind: 'error', action: FORK, message: failure });
 					return 'settled';
 				}
 				if (outcome?.ok !== true) {
@@ -430,13 +526,41 @@ window.__ModuleLoader__.load({
 						request.set({ workspaceId, source: outcome.path ?? source, mode: INITIALIZE });
 						return 'dialog';
 					}
-					notify({ kind: 'error', message: outcome?.message ?? 'the fork route reported no outcome' });
+					notify({ kind: 'error', action: FORK, message: outcome?.message ?? 'the fork route reported no outcome' });
 					return 'settled';
 				}
 				/* The Host already registered it; this adopts the same record locally. */
 				const workspace = await ctx.workspaces.create({ path: outcome.path });
 				ctx.uiWorkspace.startSession(workspace.workspaceId);
-				notify({ kind: 'ok', path: outcome.path });
+				notify({ kind: 'ok', action: FORK, path: outcome.path });
+				return 'settled';
+			};
+
+			/**
+			 * Delete the directory of one Workspace row and drop its registration.
+			 * @returns `'dialog'` when the caller must keep the dialog open in its
+			 * force mode, `'settled'` when the outcome was reported.
+			 */
+			const remove = async (workspaceId, options) => {
+				const source = pathOf(workspaceId);
+				if (source === undefined) {
+					notify({ kind: 'error', action: REMOVE, message: `unknown workspace ${workspaceId}` });
+					return 'settled';
+				}
+				const { outcome, failure } = await post(REMOVE_ROUTE, { source, force: options.force === true });
+				if (failure !== undefined) {
+					notify({ kind: 'error', action: REMOVE, message: failure });
+					return 'settled';
+				}
+				if (outcome?.ok !== true) {
+					if (outcome?.code === 'worktree-dirty' && options.force !== true) {
+						request.set({ workspaceId, source: outcome.path ?? source, mode: REMOVE_FORCE });
+						return 'dialog';
+					}
+					notify({ kind: 'error', action: REMOVE, message: outcome?.message ?? 'the remove route reported no outcome' });
+					return 'settled';
+				}
+				notify({ kind: 'ok', action: REMOVE, path: outcome.path });
 				return 'settled';
 			};
 
@@ -446,21 +570,29 @@ window.__ModuleLoader__.load({
 				yield ctx.slots.register(
 					{
 						name: 'shell.overlay',
-						id: 'fork-worktree-workspaces',
+						id: 'fork-worktree-rows',
 						locale: NS,
 						inject: () => ({
-							/* A click asks; it never creates. */
+							/* A click asks; it never acts. */
 							forkWorkspace: (workspaceId) => {
 								const source = pathOf(workspaceId);
 								if (source === undefined) {
-									notify({ kind: 'error', message: `unknown workspace ${workspaceId}` });
+									notify({ kind: 'error', action: FORK, message: `unknown workspace ${workspaceId}` });
 									return;
 								}
 								request.set({ workspaceId, source, mode: CONFIRM });
 							},
+							removeWorkspace: (workspaceId) => {
+								const source = pathOf(workspaceId);
+								if (source === undefined) {
+									notify({ kind: 'error', action: REMOVE, message: `unknown workspace ${workspaceId}` });
+									return;
+								}
+								request.set({ workspaceId, source, mode: REMOVE });
+							},
 						}),
 					},
-					WorkspaceForkHost,
+					WorkspaceRowActions,
 				);
 				yield ctx.slots.register(
 					{
@@ -468,21 +600,25 @@ window.__ModuleLoader__.load({
 						id: 'fork-worktree-dialog',
 						locale: NS,
 						inject: () => ({
-							hooks: { forkWorktreeRequest: request },
-							settleForkWorktree: () => {
+							hooks: { workspaceRequest: request },
+							settleWorkspaceRequest: () => {
 								request.set(null);
 							},
-							confirmForkWorktree: async (workspaceId, mode) => {
-								const outcome = await fork(workspaceId, { init: mode === INITIALIZE }).catch((error) => {
-									report(error);
+							confirmWorkspaceRequest: async (workspaceId, mode) => {
+								const run =
+									mode === REMOVE || mode === REMOVE_FORCE
+										? () => remove(workspaceId, { force: mode === REMOVE_FORCE })
+										: () => fork(workspaceId, { init: mode === INITIALIZE });
+								const outcome = await run().catch((error) => {
+									report(mode === REMOVE || mode === REMOVE_FORCE ? REMOVE : FORK)(error);
 									return 'settled';
 								});
-								/* Only a refusal keeps the dialog: it reopens initialized. */
+								/* Only a refusal keeps the dialog: it reopens stronger. */
 								if (outcome !== 'dialog') request.set(null);
 							},
 						}),
 					},
-					ForkWorktreeDialog,
+					WorkspaceActionDialog,
 				);
 				yield ctx.slots.register(
 					{
@@ -490,13 +626,13 @@ window.__ModuleLoader__.load({
 						id: 'fork-worktree-toast',
 						locale: NS,
 						inject: () => ({
-							hooks: { forkWorktreeToast: toast },
-							dismissForkWorktreeToast: () => {
+							hooks: { workspaceToast: toast },
+							dismissWorkspaceToast: () => {
 								toast.set(null);
 							},
 						}),
 					},
-					ForkWorktreeToast,
+					WorkspaceActionToast,
 				);
 			});
 		}

@@ -2,10 +2,18 @@
  * Host half of the `@local/dsh-fork-worktree` bundle.
  *
  * One operation, three entry points that all call {@link createWorktreeFork}:
- * the Client button POSTs to the route below, and a human can type the
+ * the Client button POSTs to the fork route below, and a human can type the
  * `/fork-worktree` command. The operation resolves a workspace directory,
  * creates a git worktree of the repository that owns it, and registers the
  * worktree as a durable DSH Workspace.
+ *
+ * A second route, {@link removeWorkspaceFolder}, does the inverse for the
+ * Client's trash button: it deletes a Workspace's directory (through
+ * `git worktree remove` when the directory is a linked worktree, so the
+ * repository's own metadata goes with it) and drops the registration. There is
+ * deliberately no command for it — a command would default to the calling
+ * Session's own workspace, and deleting the directory a user is working in must
+ * not be one keystroke away.
  *
  * The bundle also keeps Workspace rows honest: `git worktree remove` (or a
  * merge flow that deletes the checkout) makes a fork's directory disappear, and
@@ -19,7 +27,8 @@
  */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, rmSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -37,6 +46,9 @@ export const NOT_A_REPO = 'not-a-git-repo:';
 
 /** Browser route the Client button posts to. */
 const ROUTE_PATH = '/dsh-fork-worktree/fork';
+
+/** Browser route the Client's trash button posts to. */
+const REMOVE_ROUTE_PATH = '/dsh-fork-worktree/remove';
 
 /** How often the sweep looks for removed worktrees. */
 const WATCH_INTERVAL_MS = 2000;
@@ -198,6 +210,79 @@ export async function createWorktreeFork(ctx, request) {
 	};
 }
 
+/** The registered Workspace owning exactly this directory, or undefined. */
+function workspaceOwning(ctx, path) {
+	for (const workspace of ctx.workspaceRegistry.list()) if (workspace.path === path) return workspace;
+	return undefined;
+}
+
+/** Drop one Workspace registration, tolerating one that is already gone. */
+async function unregisterWorkspace(ctx, workspace) {
+	if (workspace === undefined) return;
+	try {
+		await ctx.workspaceRegistry.delete(workspace.id);
+	} catch {
+		/* the removal sweep covers a registration this call could not commit */
+	}
+}
+
+/**
+ * The main worktree that owns a linked worktree, or undefined when its
+ * repository cannot be reached (a deleted main checkout, for example).
+ */
+async function mainWorktreeOf(dir) {
+	const common = await git(['rev-parse', '--path-format=absolute', '--git-common-dir'], dir);
+	if (!common.ok || common.stdout === '') return undefined;
+	const root = dirname(common.stdout);
+	return existsSync(root) ? root : undefined;
+}
+
+/**
+ * Delete one Workspace's directory and drop its registration.
+ *
+ * A linked worktree goes through `git worktree remove`, so the repository's own
+ * `worktrees/` metadata leaves with the checkout; any other directory is
+ * removed as a directory. A worktree with uncommitted or untracked content is
+ * refused unless `force` is set, which is what makes the Client able to ask a
+ * second question before discarding work.
+ *
+ * @param ctx - Host context owning the Workspace registry.
+ * @param request - directory to delete and whether dirty content may go with it.
+ * @returns an outcome carrying the path and the method used, or a stable code.
+ */
+export async function removeWorkspaceFolder(ctx, request) {
+	const source = request.source;
+	if (typeof source !== 'string' || source === '') return { kind: 'error', code: 'no-source', text: 'no workspace directory was given' };
+	if (!existsSync(source)) return { kind: 'error', code: 'source-missing', text: `workspace directory does not exist: ${source}` };
+	if (!statSync(source).isDirectory()) return { kind: 'error', code: 'source-not-directory', text: `workspace path is not a directory: ${source}` };
+	if (source === homedir() || dirname(source) === source) return { kind: 'error', code: 'refused-path', text: `refusing to delete ${source}` };
+
+	const workspace = workspaceOwning(ctx, source);
+	if (isLinkedWorktree(source)) {
+		const root = await mainWorktreeOf(source);
+		if (root !== undefined) {
+			if (request.force !== true) {
+				const status = await git(['status', '--porcelain'], source);
+				if (status.ok && status.stdout !== '') {
+					return { kind: 'error', code: 'worktree-dirty', path: source, text: `${source} contains modified or untracked files` };
+				}
+			}
+			const removed = await git(['worktree', 'remove', ...(request.force === true ? ['--force'] : []), source], root);
+			if (!removed.ok) return { kind: 'error', code: 'worktree-remove-failed', path: source, text: removed.message };
+			await unregisterWorkspace(ctx, workspace);
+			return { kind: 'success', path: source, method: 'worktree-remove', text: `removed worktree ${source}` };
+		}
+	}
+
+	try {
+		rmSync(source, { recursive: true, force: true });
+	} catch (error) {
+		return { kind: 'error', code: 'remove-failed', path: source, text: error instanceof Error ? error.message : String(error) };
+	}
+	await unregisterWorkspace(ctx, workspace);
+	return { kind: 'success', path: source, method: 'removed-directory', text: `removed directory ${source}` };
+}
+
 /** Parse `[<name>] [--init]`, rejecting anything else loudly enough to correct. */
 function parseArguments(rawInput) {
 	let name;
@@ -328,13 +413,15 @@ async function readBoundedBody(req) {
 }
 
 /**
- * The route the Client button calls: `{ source, name?, init? }` in,
- * `{ ok: true, path, workspaceId, branch }` or `{ ok: false, code, message }` out.
+ * The envelope every route of this bundle shares: the connection's trust fence,
+ * `POST` with a JSON object body, and a bounded JSON answer. The handler decides
+ * only the status and body of an admitted request.
  *
- * @param ctx - Host context owning the registry and the trust check.
+ * @param ctx - Host context owning the trust check.
+ * @param handle - admitted request handler.
  * @returns the Node request handler.
  */
-export function forkRoute(ctx) {
+function jsonPost(ctx, handle) {
 	return async (req, res) => {
 		const rejection = ctx.connection.requestRejection(req);
 		if (rejection !== undefined) {
@@ -368,36 +455,81 @@ export function forkRoute(ctx) {
 			sendJson(res, 400, { ok: false, code: 'invalid-request', message: 'request body must be an object' });
 			return;
 		}
-		if (typeof payload.source !== 'string' || payload.source === '') {
-			sendJson(res, 400, { ok: false, code: 'invalid-request', message: 'source must be a non-empty path' });
-			return;
-		}
+		const answer = await handle(payload).catch((error) => ({
+			status: 500,
+			body: { ok: false, code: 'internal', message: error instanceof Error ? error.message : String(error) },
+		}));
+		sendJson(res, answer.status, answer.body);
+	};
+}
+
+/** One rejected field, in the envelope's error shape. */
+function invalidRequest(message) {
+	return { status: 400, body: { ok: false, code: 'invalid-request', message } };
+}
+
+/**
+ * The route the Client's fork button calls: `{ source, name?, init? }` in,
+ * `{ ok: true, path, workspaceId, branch }` or `{ ok: false, code, message }` out.
+ *
+ * @param ctx - Host context owning the registry and the trust check.
+ * @returns the Node request handler.
+ */
+export function forkRoute(ctx) {
+	return jsonPost(ctx, async (payload) => {
+		if (typeof payload.source !== 'string' || payload.source === '') return invalidRequest('source must be a non-empty path');
 		const outcome = await createWorktreeFork(ctx, {
 			source: payload.source,
 			...(typeof payload.name === 'string' && payload.name !== '' ? { name: payload.name } : {}),
 			init: payload.init === true,
-		}).catch((error) => ({
-			kind: 'error',
-			code: 'internal',
-			text: error instanceof Error ? error.message : String(error),
-		}));
-		if (outcome.kind === 'success') {
-			sendJson(res, 200, {
-				ok: true,
-				path: outcome.path,
-				branch: outcome.branch,
-				workspaceId: outcome.workspaceId,
-				text: outcome.text,
-			});
-			return;
-		}
-		sendJson(res, 200, {
-			ok: false,
-			code: outcome.code,
-			message: outcome.text,
-			...(outcome.code === 'not-a-git-repo' ? { path: payload.source } : {}),
 		});
-	};
+		if (outcome.kind === 'success') {
+			return {
+				status: 200,
+				body: {
+					ok: true,
+					path: outcome.path,
+					branch: outcome.branch,
+					workspaceId: outcome.workspaceId,
+					text: outcome.text,
+				},
+			};
+		}
+		return {
+			status: 200,
+			body: {
+				ok: false,
+				code: outcome.code,
+				message: outcome.text,
+				...(outcome.code === 'not-a-git-repo' ? { path: payload.source } : {}),
+			},
+		};
+	});
+}
+
+/**
+ * The route the Client's trash button calls: `{ source, force? }` in,
+ * `{ ok: true, path, method }` or `{ ok: false, code, message, path? }` out.
+ * `worktree-dirty` is the one failure the Client answers by asking again.
+ *
+ * @param ctx - Host context owning the registry and the trust check.
+ * @returns the Node request handler.
+ */
+export function removeRoute(ctx) {
+	return jsonPost(ctx, async (payload) => {
+		if (typeof payload.source !== 'string' || payload.source === '') return invalidRequest('source must be a non-empty path');
+		const outcome = await removeWorkspaceFolder(ctx, { source: payload.source, force: payload.force === true });
+		if (outcome.kind === 'success') return { status: 200, body: { ok: true, path: outcome.path, method: outcome.method, text: outcome.text } };
+		return {
+			status: 200,
+			body: {
+				ok: false,
+				code: outcome.code,
+				message: outcome.text,
+				...(outcome.path === undefined ? {} : { path: outcome.path }),
+			},
+		};
+	});
 }
 
 /**
@@ -427,6 +559,10 @@ export function apply(ctx) {
 	ctx.effect(
 		() => ctx.webServer.register({ kind: 'exact', path: ROUTE_PATH, handler: forkRoute(ctx) }),
 		`fork-worktree: POST ${ROUTE_PATH}`,
+	);
+	ctx.effect(
+		() => ctx.webServer.register({ kind: 'exact', path: REMOVE_ROUTE_PATH, handler: removeRoute(ctx) }),
+		`fork-worktree: POST ${REMOVE_ROUTE_PATH}`,
 	);
 	ctx.effect(() => watchRemovedWorktrees(ctx), 'fork-worktree: removed-worktree sweep');
 }

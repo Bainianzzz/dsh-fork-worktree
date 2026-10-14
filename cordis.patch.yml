@@ -1,0 +1,7 @@
+# Host row of the bundle. The name is the package itself, which the loader
+# resolves from the profile's node_modules; index.js then imports the
+# implementation with a per-load nonce (see index.js) so a disabled-and-enabled
+# row in a live profile runs the current revision.
+- insert:
+    - id: fork-worktree
+      name: '@bainianzzz/dsh-fork-worktree'
