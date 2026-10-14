@@ -1,0 +1,432 @@
+/**
+ * Host half of the `@local/dsh-fork-worktree` bundle.
+ *
+ * One operation, three entry points that all call {@link createWorktreeFork}:
+ * the Client button POSTs to the route below, and a human can type the
+ * `/fork-worktree` command. The operation resolves a workspace directory,
+ * creates a git worktree of the repository that owns it, and registers the
+ * worktree as a durable DSH Workspace.
+ *
+ * The bundle also keeps Workspace rows honest: `git worktree remove` (or a
+ * merge flow that deletes the checkout) makes a fork's directory disappear, and
+ * a sweep then removes that Workspace registration instead of leaving a broken
+ * row behind. A directory that exists and carries a `.git` file is a linked
+ * worktree, which is what the sweep tracks; a missing directory is accepted as
+ * a removed fork when the name says so (a generated label, or an explicit label
+ * beside its repository), so a restart does not strand the row either.
+ *
+ * @module @local/dsh-fork-worktree
+ */
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { existsSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { promisify } from 'node:util';
+
+/** Plugin display name for the Loader row. */
+export const name = 'fork-worktree';
+
+/** Host capabilities this bundle registers through. */
+export const inject = ['commands', 'connection', 'webServer', 'workspaceRegistry'];
+
+/** Command name without its slash. */
+const COMMAND = 'fork-worktree';
+
+/** First-line marker the command answers a non-repository directory with. */
+export const NOT_A_REPO = 'not-a-git-repo:';
+
+/** Browser route the Client button posts to. */
+const ROUTE_PATH = '/dsh-fork-worktree/fork';
+
+/** How often the sweep looks for removed worktrees. */
+const WATCH_INTERVAL_MS = 2000;
+
+/** Route request bodies are two short fields; anything larger is hostile. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+/** The infix between a repository name and a fork label. */
+const FORK_INFIX = '-wt-';
+
+/** A generated label: six lowercase hex characters. */
+const GENERATED_LABEL = /^[0-9a-f]{6}$/u;
+
+const USAGE = `Usage: /${COMMAND} [<name>] [--init]`;
+
+const execFileAsync = promisify(execFile);
+
+/** Failure text for one rejected git invocation, preferring git's own stderr. */
+function gitFailureMessage(error) {
+	if (error !== null && typeof error === 'object' && typeof error.stderr === 'string' && error.stderr.trim() !== '') return error.stderr.trim();
+	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Run one git invocation in a fixed working directory.
+ *
+ * No cancellation signal is threaded through: every invocation here mutates or
+ * inspects this repository in well under a second, and abandoning a half-done
+ * `git worktree add` would leave a registered worktree with no checkout.
+ *
+ * @param args - git arguments, without the executable.
+ * @param cwd - working directory the invocation resolves paths against.
+ * @returns the trimmed stdout, or the failure message.
+ */
+async function git(args, cwd) {
+	try {
+		const { stdout } = await execFileAsync('git', args, {
+			cwd,
+			timeout: 120_000,
+			maxBuffer: 8 * 1024 * 1024,
+			windowsHide: true,
+		});
+		return { ok: true, stdout: String(stdout).trim() };
+	} catch (error) {
+		return { ok: false, message: gitFailureMessage(error) };
+	}
+}
+
+/** The repository root that owns `source`, or undefined when there is none. */
+async function existingRepositoryRoot(source) {
+	const result = await git(['rev-parse', '--show-toplevel'], source);
+	/* git rev-parse exits non-zero outside a work tree; an empty stdout is the same answer. */
+	if (!result.ok || result.stdout === '') return undefined;
+	return result.stdout;
+}
+
+/**
+ * Make the directory a repository when it is not one yet.
+ *
+ * `git worktree add` needs a commit to start from, so initialization commits the
+ * directory's current content as the first commit (an empty commit when there is
+ * nothing to add). That is what makes the worktree a copy of what the directory
+ * holds now instead of an empty checkout.
+ *
+ * @param source - existing directory to inspect, and possibly to initialize.
+ * @param allowInit - whether initialization is permitted at all.
+ * @returns the repository root, or the refusal.
+ */
+async function repositoryRoot(source, allowInit) {
+	const existing = await existingRepositoryRoot(source);
+	if (existing !== undefined) return { ok: true, root: existing, initialized: false };
+	if (!allowInit) return { ok: false, notARepository: true };
+	const initialized = await git(['init'], source);
+	if (!initialized.ok) return { ok: false, message: `git init failed: ${initialized.message}` };
+	const identity = ['-c', 'user.name=DSH', '-c', 'user.email=dsh@localhost', '-c', 'commit.gpgsign=false'];
+	/* A failed `add` only decides whether the commit below is empty. */
+	await git(['add', '--all'], source);
+	const message = 'Initialize repository for worktree forks';
+	const committed = await git([...identity, 'commit', '-m', message], source);
+	if (!committed.ok) {
+		const empty = await git([...identity, 'commit', '--allow-empty', '-m', message], source);
+		if (!empty.ok) return { ok: false, message: `git commit failed: ${empty.message}` };
+	}
+	const root = await existingRepositoryRoot(source);
+	if (root === undefined) return { ok: false, message: 'git init produced no repository' };
+	return { ok: true, root, initialized: true };
+}
+
+/** A path- and branch-safe label derived from a caller-supplied name. */
+function sanitizeLabel(raw) {
+	const cleaned = raw.trim().replace(/[^A-Za-z0-9._-]+/gu, '-').replace(/^[.-]+|[.-]+$/gu, '');
+	return cleaned === '' || cleaned === '.' ? undefined : cleaned;
+}
+
+/** Six lowercase hex characters, unique enough for one sibling directory. */
+function shortId() {
+	return randomUUID().replace(/-/gu, '').slice(0, 6);
+}
+
+/** Effective Session working directory, or undefined when the Session records none. */
+function sessionCwd(agent) {
+	const cwd = agent?.session?.header?.cwd;
+	return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
+}
+
+/**
+ * Create one worktree of `source`'s repository and register it as a Workspace.
+ *
+ * @param ctx - Host context owning the Workspace registry.
+ * @param request - source directory, optional label, and whether to initialize.
+ * @returns an outcome carrying either the new path and Workspace, or a stable code.
+ */
+export async function createWorktreeFork(ctx, request) {
+	const source = request.source;
+	if (typeof source !== 'string' || source === '') return { kind: 'error', code: 'no-source', text: 'no workspace directory was given' };
+	if (!existsSync(source)) return { kind: 'error', code: 'source-missing', text: `workspace directory does not exist: ${source}` };
+	if (!statSync(source).isDirectory()) return { kind: 'error', code: 'source-not-directory', text: `workspace path is not a directory: ${source}` };
+
+	const repository = await repositoryRoot(source, request.init === true);
+	if (!repository.ok) {
+		if (repository.notARepository === true) return { kind: 'error', code: 'not-a-git-repo', text: `${NOT_A_REPO} ${source}` };
+		return { kind: 'error', code: 'git-failed', text: repository.message };
+	}
+
+	const root = repository.root;
+	const label = (request.name === undefined ? undefined : sanitizeLabel(request.name)) ?? shortId();
+	const target = join(dirname(root), `${basename(root)}${FORK_INFIX}${label}`);
+	const branch = `wt/${label}`;
+	if (existsSync(target)) return { kind: 'error', code: 'target-exists', text: `worktree target already exists: ${target}` };
+
+	const added = await git(['worktree', 'add', '-b', branch, target, 'HEAD'], source);
+	if (!added.ok) return { kind: 'error', code: 'git-failed', text: `git worktree add failed: ${added.message}` };
+
+	let workspace;
+	try {
+		workspace = await ctx.workspaceRegistry.create(target);
+	} catch (error) {
+		/* The checkout exists; report where it is instead of hiding it behind the failure. */
+		return {
+			kind: 'error',
+			code: 'register-failed',
+			text: `worktree created at ${target}, but workspace registration failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	return {
+		kind: 'success',
+		path: target,
+		branch,
+		workspaceId: workspace.id,
+		text: [
+			target,
+			'',
+			`branch: ${branch}`,
+			`source: ${root}`,
+			`repository: ${repository.initialized ? 'initialized' : 'existing'}`,
+			`workspace: ${workspace.path}`,
+		].join('\n'),
+	};
+}
+
+/** Parse `[<name>] [--init]`, rejecting anything else loudly enough to correct. */
+function parseArguments(rawInput) {
+	let name;
+	let init = false;
+	for (const token of rawInput.trim().split(/\s+/u).filter((part) => part !== '')) {
+		if (token === '--init') {
+			init = true;
+			continue;
+		}
+		if (token.startsWith('-')) return { error: `unknown option "${token}".\n${USAGE}` };
+		if (name !== undefined) return { error: `at most one name is accepted.\n${USAGE}` };
+		name = token;
+	}
+	return { name, init };
+}
+
+/** Whether `dir` is the checkout of a linked worktree rather than a repository root. */
+function isLinkedWorktree(dir) {
+	try {
+		return statSync(join(dir, '.git')).isFile();
+	} catch {
+		return false;
+	}
+}
+
+/** Split `<repository>-wt-<label>` into its halves, or undefined for any other name. */
+function forkLabelOf(path) {
+	const name = basename(path);
+	const at = name.lastIndexOf(FORK_INFIX);
+	if (at <= 0) return undefined;
+	const label = name.slice(at + FORK_INFIX.length);
+	if (label === '') return undefined;
+	return { repository: name.slice(0, at), label };
+}
+
+/**
+ * Whether a *missing* directory was a fork this bundle could have made: its
+ * generated label, or an explicit label adopted beside the repository it names.
+ */
+function looksLikeForkPath(path) {
+	const parts = forkLabelOf(path);
+	if (parts === undefined) return false;
+	if (GENERATED_LABEL.test(parts.label)) return true;
+	return existsSync(join(dirname(path), parts.repository));
+}
+
+/**
+ * Remove the Workspace registration of a fork whose checkout is gone.
+ *
+ * A directory that exists and carries a `.git` file is a linked worktree, and
+ * that is what this sweep tracks; once tracked, two consecutive sweeps must find
+ * the directory missing before the registration goes, so a path that is briefly
+ * unreadable (a sleeping volume, a running `git worktree move`) cannot cost the
+ * user a Workspace. A directory that was never seen in this process is still
+ * accepted when the name says it was a fork — see
+ * {@link looksLikeForkPath} — so a restart does not strand the row either.
+ * Nothing is reported when it works, and nothing is reported when the
+ * registration was already gone.
+ *
+ * Exported for the standalone verification in `verify-host.mjs`.
+ *
+ * @param ctx - Host context owning the Workspace registry.
+ * @param intervalMs - sweep period; the default is the shipped one.
+ * @returns the sweep's disposer.
+ */
+export function watchRemovedWorktrees(ctx, intervalMs = WATCH_INTERVAL_MS) {
+	const tracked = new Set();
+	const missing = new Map();
+	const sweep = async () => {
+		let workspaces;
+		try {
+			workspaces = ctx.workspaceRegistry.list();
+		} catch {
+			return;
+		}
+		const live = new Set();
+		for (const workspace of workspaces) {
+			live.add(workspace.id);
+			if (existsSync(workspace.path)) {
+				missing.delete(workspace.id);
+				if (isLinkedWorktree(workspace.path)) tracked.add(workspace.id);
+				else tracked.delete(workspace.id);
+				continue;
+			}
+			if (!tracked.has(workspace.id) && !looksLikeForkPath(workspace.path)) continue;
+			const strikes = (missing.get(workspace.id) ?? 0) + 1;
+			missing.set(workspace.id, strikes);
+			if (strikes < 2) continue;
+			missing.delete(workspace.id);
+			tracked.delete(workspace.id);
+			try {
+				await ctx.workspaceRegistry.delete(workspace.id);
+			} catch {
+				/* an already-absent registration is the outcome we wanted */
+			}
+		}
+		for (const id of [...tracked]) if (!live.has(id)) tracked.delete(id);
+		for (const id of [...missing.keys()]) if (!live.has(id)) missing.delete(id);
+	};
+	const timer = setInterval(() => {
+		sweep().catch(() => {});
+	}, intervalMs);
+	sweep().catch(() => {});
+	return () => clearInterval(timer);
+}
+
+/** Bounded JSON response. */
+function sendJson(res, status, payload) {
+	res.statusCode = status;
+	res.setHeader('content-type', 'application/json; charset=utf-8');
+	res.setHeader('cache-control', 'no-store');
+	res.end(JSON.stringify(payload));
+}
+
+/** Collect a bounded request body as UTF-8 text; null past the ceiling (stream drained). */
+async function readBoundedBody(req) {
+	const chunks = [];
+	let size = 0;
+	for await (const chunk of req) {
+		size += chunk.byteLength;
+		if (size > MAX_BODY_BYTES) {
+			req.resume();
+			return null;
+		}
+		chunks.push(chunk);
+	}
+	return Buffer.concat(chunks, size).toString('utf8');
+}
+
+/**
+ * The route the Client button calls: `{ source, name?, init? }` in,
+ * `{ ok: true, path, workspaceId, branch }` or `{ ok: false, code, message }` out.
+ *
+ * @param ctx - Host context owning the registry and the trust check.
+ * @returns the Node request handler.
+ */
+export function forkRoute(ctx) {
+	return async (req, res) => {
+		const rejection = ctx.connection.requestRejection(req);
+		if (rejection !== undefined) {
+			res.statusCode = rejection;
+			res.end();
+			return;
+		}
+		if (req.method !== 'POST') {
+			res.statusCode = 405;
+			res.setHeader('allow', 'POST');
+			res.end();
+			return;
+		}
+		if (String(req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+			sendJson(res, 415, { ok: false, code: 'unsupported-media-type', message: 'content-type must be application/json' });
+			return;
+		}
+		const body = await readBoundedBody(req);
+		if (body === null) {
+			sendJson(res, 413, { ok: false, code: 'body-too-large', message: `request body exceeds ${MAX_BODY_BYTES} bytes` });
+			return;
+		}
+		let payload;
+		try {
+			payload = JSON.parse(body);
+		} catch {
+			sendJson(res, 400, { ok: false, code: 'invalid-json', message: 'request body is not JSON' });
+			return;
+		}
+		if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+			sendJson(res, 400, { ok: false, code: 'invalid-request', message: 'request body must be an object' });
+			return;
+		}
+		if (typeof payload.source !== 'string' || payload.source === '') {
+			sendJson(res, 400, { ok: false, code: 'invalid-request', message: 'source must be a non-empty path' });
+			return;
+		}
+		const outcome = await createWorktreeFork(ctx, {
+			source: payload.source,
+			...(typeof payload.name === 'string' && payload.name !== '' ? { name: payload.name } : {}),
+			init: payload.init === true,
+		}).catch((error) => ({
+			kind: 'error',
+			code: 'internal',
+			text: error instanceof Error ? error.message : String(error),
+		}));
+		if (outcome.kind === 'success') {
+			sendJson(res, 200, {
+				ok: true,
+				path: outcome.path,
+				branch: outcome.branch,
+				workspaceId: outcome.workspaceId,
+				text: outcome.text,
+			});
+			return;
+		}
+		sendJson(res, 200, {
+			ok: false,
+			code: outcome.code,
+			message: outcome.text,
+			...(outcome.code === 'not-a-git-repo' ? { path: payload.source } : {}),
+		});
+	};
+}
+
+/**
+ * Register the human command the same operation serves: a second caller beside
+ * the Client button, typed into the composer of the workspace to fork.
+ *
+ * @param ctx - Host context carrying the command registry.
+ */
+export function apply(ctx) {
+	ctx.commands.register({
+		name: COMMAND,
+		description: "Create a git worktree of this Session's workspace and register it as a new workspace",
+		input: { hint: '[<name>] [--init]' },
+		handler: async (invocation) => {
+			const parsed = parseArguments(invocation.rawInput);
+			if (parsed.error !== undefined) return { kind: 'error', text: parsed.error };
+			const source = sessionCwd(invocation.agent);
+			if (source === undefined) return { kind: 'error', text: 'this Session records no working directory' };
+			const outcome = await createWorktreeFork(ctx, {
+				source,
+				...(parsed.name === undefined ? {} : { name: parsed.name }),
+				init: parsed.init,
+			});
+			return outcome.kind === 'success' ? { kind: 'success', text: outcome.text } : { kind: 'error', text: outcome.text };
+		},
+	});
+	ctx.effect(
+		() => ctx.webServer.register({ kind: 'exact', path: ROUTE_PATH, handler: forkRoute(ctx) }),
+		`fork-worktree: POST ${ROUTE_PATH}`,
+	);
+	ctx.effect(() => watchRemovedWorktrees(ctx), 'fork-worktree: removed-worktree sweep');
+}
