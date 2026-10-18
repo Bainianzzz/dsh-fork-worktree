@@ -2,16 +2,22 @@
  * Standalone smoke test for the fork-worktree Client half, run outside dsh.
  *
  * `client.js` is a `window.__ModuleLoader__` bundle whose only imports are
- * React and ReactDOM, so this script supplies a minimal React runtime (element
- * creation, `useState`, `useRef`, `useEffect`, `Fragment`), a fake module
- * loader, a fake Client context, and a fake `fetch`. The components under test
- * are the real ones: `apply` registers them, this harness paints them and
- * invokes the handlers a click would.
+ * React, ReactDOM, and the host's exported `Toast` (from
+ * `@deepseek-ai/dsh-client-ui-primitives`), so this script supplies a minimal
+ * React runtime (element creation, `useState`, `useRef`, `useEffect`,
+ * `Fragment`), a stand-in for those two host exports, a fake module loader, a
+ * fake Client context, and a fake `fetch`. The components under test are the
+ * real ones: `apply` registers them, this harness paints them and invokes the
+ * handlers a click would.
  *
  * It covers the single-panel fork flow: one dialog explains both modes and
  * offers one button per mode, each button posts its own `mode`, a non-repository
  * refusal reopens the initialize step with the chosen mode kept, success closes
  * the dialog and toasts the copied count, and the removal steps are unchanged.
+ *
+ * It also pins the banner contract: the outcome renders the host's `Toast` —
+ * not a hand-rolled banner at the same fixed coordinates — keyed by the
+ * notice's sequence, with `onDone` wired to the dismissal.
  *
  * Run with `node verify-client.mjs`. No dependency, no browser, no dsh.
  */
@@ -71,6 +77,21 @@ function Fragment(props) {
 const React = { createElement, useState, useRef, useEffect, Fragment };
 const ReactDOM = {};
 
+/**
+ * Stand-in for the two host exports the bundle requires. They are marker
+ * components, not the host's real ones: the harness asserts that the bundle
+ * *renders* the host's `Toast` with the right props, not that it reimplements
+ * the host's stylesheet. `renderNode` keeps them as inspectable nodes.
+ */
+function HostToast() {
+	return null;
+}
+function HostWarningIcon() {
+	return null;
+}
+const HOST_STAND_INS = new Set([HostToast, HostWarningIcon]);
+const hostPrimitives = { Toast: HostToast, IconWarningOutlineRegular: HostWarningIcon };
+
 /** Expand one element tree into plain `{ type, props, children }` nodes. */
 function renderNode(node) {
 	if (node === null || node === undefined || node === false || node === true) return null;
@@ -91,6 +112,10 @@ function renderNode(node) {
 			out = node.type(node.props ?? {});
 		} finally {
 			currentStore = previous;
+		}
+		/* The host stand-ins stay as nodes so their props can be asserted. */
+		if (HOST_STAND_INS.has(node.type)) {
+			return { type: node.type, props: node.props ?? {}, children: [] };
 		}
 		return renderNode(out);
 	}
@@ -174,7 +199,11 @@ const context = {
 	},
 };
 
-const modules = { react: React, 'react-dom': ReactDOM };
+const modules = {
+	react: React,
+	'react-dom': ReactDOM,
+	'@deepseek-ai/dsh-client-ui-primitives': hostPrimitives,
+};
 factory((name) => {
 	if (!(name in modules)) throw new Error(`unexpected require: ${name}`);
 	return modules[name];
@@ -231,6 +260,9 @@ const paintToast = () =>
 			useWorkspaceToast: (selector) => selector(toastStore.getSnapshot()),
 		}),
 	);
+
+/** The text the bundle handed the host's Toast on the current paint. */
+const toastText = () => findAll(paintToast(), (node) => node.type === HostToast)[0]?.props.text ?? '';
 
 const click = async (root, label) => {
 	const button = buttons(root).find((node) => textOf(node) === label);
@@ -292,7 +324,20 @@ check('success adopts the workspace', workspaces.rows.length === 2 && workspaces
 check('success opens a session', sessions.length === 1 && sessions[0] === 'w2', JSON.stringify(sessions));
 check('success toasts the path', toastState()?.kind === 'ok' && toastState()?.path === '/tmp/repo-wt-abc123', JSON.stringify(toastState()));
 check('success toasts the copied count', toastState()?.copied === 7, String(toastState()?.copied));
-check('the toast names the copied count', textOf(paintToast()).includes('复制了 7 项'), textOf(paintToast()));
+check('the toast names the copied count', toastText().includes('复制了 7 项'), toastText());
+
+/* Case 3b: the banner is the host's Toast, not a hand-rolled one at its coordinates. */
+const paintedToast = paintToast();
+const hostBanners = findAll(paintedToast, (node) => node.type === HostToast);
+check('the outcome renders the host Toast', hostBanners.length === 1, `found ${String(hostBanners.length)}`);
+check('the host Toast carries the text', hostBanners[0]?.props.text === '已创建 worktree 工作区：/tmp/repo-wt-abc123（复制了 7 项）', hostBanners[0]?.props.text);
+check('a success uses the host success tone', hostBanners[0]?.props.tone === 'success' && hostBanners[0]?.props.icon === undefined, JSON.stringify(Object.keys(hostBanners[0]?.props ?? {})));
+check('the host Toast gets the bundle hold', hostBanners[0]?.props.holdMs === 3200, String(hostBanners[0]?.props.holdMs));
+check('the host Toast is keyed by the notice sequence', hostBanners[0]?.props.key === 'toast-1', String(hostBanners[0]?.props.key));
+check('no hand-rolled banner class survives', findAll(paintedToast, (node) => String(node.props?.className ?? '').includes('dshForkWtToast')).length === 0);
+check('the host Toast ends by dismissing the notice', typeof hostBanners[0]?.props.onDone === 'function');
+hostBanners[0].props.onDone();
+check('onDone clears the notice', toastState() === null, JSON.stringify(toastState()));
 
 /* Case 4: the git button creates without copying. */
 calls.length = 0;
@@ -303,7 +348,7 @@ await click(root, '创建 git worktree');
 await settle();
 check('the git button creates without copying', calls.length === 1 && calls[0].body.mode === 'git', JSON.stringify(calls[0]?.body));
 check('a git-mode fork toasts without a count', toastState()?.copied === 0);
-check('a git-mode toast shows only the path', textOf(paintToast()).includes('已创建 worktree 工作区：/tmp/repo-wt-def456') && !textOf(paintToast()).includes('复制了'));
+check('a git-mode toast shows only the path', toastText().includes('已创建 worktree 工作区：/tmp/repo-wt-def456') && !toastText().includes('复制了'), toastText());
 
 /* Case 5: cancel closes without posting. */
 calls.length = 0;
@@ -323,6 +368,18 @@ root = paint();
 const danger = buttons(root).find((node) => textOf(node) === '强制删除');
 check('force step is destructive styling', danger?.props.className.includes('dshForkWtActionDanger') === true, danger?.props.className);
 check('force step says why', textOf(root).includes('未提交的修改或未跟踪文件'));
+
+/* Case 7: a failure is still the host Toast, with its warning glyph and no success tone. */
+requestStore.set({ workspaceId: 'w1', source: '/tmp/repo', mode: 'remove', copy: false });
+root = paint();
+response = { ok: false, message: 'fatal: not a git repository' };
+await click(root, '删除文件夹');
+await settle();
+const failedBanner = findAll(paintToast(), (node) => node.type === HostToast)[0];
+check('a failure also renders the host Toast', failedBanner !== undefined);
+check('a failure drops the success tone', failedBanner?.props.tone === undefined);
+check('a failure names its warning glyph', failedBanner?.props.icon?.type === HostWarningIcon);
+check('a failure quotes the reason', failedBanner?.props.text === '删除失败：fatal: not a git repository', failedBanner?.props.text);
 
 console.log(checks.join('\n'));
 const failed = checks.filter((line) => line.startsWith('FAIL')).length;

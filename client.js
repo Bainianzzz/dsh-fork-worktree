@@ -25,9 +25,10 @@
  * content answers `worktree-dirty`, and the dialog reopens in its force mode
  * instead of discarding work.
  *
- * Controls are hand-written against theme tokens; the markup and CSS follow the
- * host's `iconButton`, `Modal`, `Toast`, and destructive `Button` and share only
- * the `--dsw-*` tokens.
+ * The row buttons and the dialog are hand-written against theme tokens, following
+ * the host's `iconButton`, `Modal`, and destructive `Button` and sharing only the
+ * `--dsw-*` tokens. The outcome banner is not: it renders the host's exported
+ * `Toast`, so it sits where every other notice does instead of over one.
  */
 window.__ModuleLoader__.load({
 	id: '@bainianzzz/dsh-fork-worktree',
@@ -36,6 +37,7 @@ window.__ModuleLoader__.load({
 		const ReactDOM = require('react-dom');
 		const h = React.createElement;
 		const createPortal = ReactDOM.createPortal ?? ReactDOM.default?.createPortal;
+		const { Toast, IconWarningOutlineRegular } = require('@deepseek-ai/dsh-client-ui-primitives');
 
 		/** Dictionary namespace owned by this plugin. */
 		const NS = 'fork-worktree';
@@ -157,11 +159,6 @@ window.__ModuleLoader__.load({
 .dshForkWtActionGhost{border-color:transparent;background:transparent;color:var(--dsw-alias-label-secondary)}
 .dshForkWtActionGhost:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
 .dshForkWtActionDanger:not(:disabled){color:var(--dsw-alias-state-error-primary)}
-.dshForkWtToast{position:fixed;top:40px;left:50%;z-index:1100;display:flex;align-items:center;gap:10px;width:max-content;max-width:min(640px,calc(100vw - 48px));padding:12px 16px;border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-toast-bg);color:var(--dsw-alias-toast-label);font-size:14px;line-height:22px;pointer-events:none;transform:translateX(-50%)}
-.dshForkWtDot{flex:none;width:8px;height:8px;border-radius:50%}
-.dshForkWtDotOk{background:var(--dsw-alias-state-success-primary)}
-.dshForkWtDotError{background:var(--dsw-alias-state-error-primary)}
-.dshForkWtToastText{min-width:0;overflow-wrap:anywhere}
 `;
 
 		/** The bundle's one stylesheet, rendered by each root component so unmounting removes it. */
@@ -538,37 +535,40 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** The outcome banner for one finished attempt. */
+		/**
+		 * The outcome banner for one finished attempt, on the host's own `Toast`.
+		 *
+		 * The banner is the host's component rather than a copy of its markup:
+		 * that component portals itself to `document.body` at the same fixed
+		 * `top` and `z-index` the host's other notices use, and it runs its own
+		 * hold-then-fade cycle, reporting `onDone` when the fade completes. A
+		 * hand-rolled banner at those coordinates would sit on top of whichever
+		 * host notice is showing instead of behaving like one of them.
+		 *
+		 * Re-keyed by `seq` so a second outcome remounts the component and
+		 * restarts its cycle, matching how every host owner shows a notice.
+		 */
 		function WorkspaceActionToast({ useWorkspaceToast, dismissWorkspaceToast, t }) {
 			const toast = useWorkspaceToast((pending) => pending);
-			React.useEffect(() => {
-				if (toast === null) return undefined;
-				const timer = setTimeout(dismissWorkspaceToast, TOAST_HOLD_MS);
-				return () => clearTimeout(timer);
-			}, [toast === null ? 0 : toast.seq]);
 			if (toast === null) return null;
 			const removed = toast.action !== FORK;
 			const copied = toast.kind === 'ok' && !removed && toast.copied > 0;
-			const text =
-				toast.kind === 'ok'
-					? t(copied ? 'toast.forkedCopied' : removed ? 'toast.removed' : 'toast.forked', {
-							path: toast.path,
-							...(copied ? { count: toast.copied } : {}),
-						})
-					: t(removed ? 'toast.removeFailed' : 'toast.forkFailed', { message: toast.message });
-			return h(
-				React.Fragment,
-				null,
-				h(Styles),
-				h(
-					'div',
-					{ className: 'dshForkWtToast', role: 'status' },
-					h('span', {
-						className: `dshForkWtDot ${toast.kind === 'ok' ? 'dshForkWtDotOk' : 'dshForkWtDotError'}`,
-					}),
-					h('span', { className: 'dshForkWtToastText' }, text),
-				),
-			);
+			const props = {
+				text:
+					toast.kind === 'ok'
+						? t(copied ? 'toast.forkedCopied' : removed ? 'toast.removed' : 'toast.forked', {
+								path: toast.path,
+								...(copied ? { count: toast.copied } : {}),
+							})
+						: t(removed ? 'toast.removeFailed' : 'toast.forkFailed', { message: toast.message }),
+				/* The host pairs a success with its own check glyph; only failures name a warning. */
+				...(toast.kind === 'ok'
+					? { tone: 'success' }
+					: { icon: h(IconWarningOutlineRegular, {}) }),
+				holdMs: TOAST_HOLD_MS,
+				onDone: dismissWorkspaceToast,
+			};
+			return h(Toast, { ...props, key: `toast-${toast.seq}` });
 		}
 
 		/** Client services this bundle registers through. */
