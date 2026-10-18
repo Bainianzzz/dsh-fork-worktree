@@ -13,6 +13,8 @@
 
 安装并启用后 hover 工作区行即可看到按钮。
 
+> 更多安装方式请查看 [Release 页](https://github.com/Bainianzzz/dsh-fork-worktree/releases)
+
 ## 用法
 
 ### fork
