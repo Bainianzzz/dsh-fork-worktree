@@ -1,6 +1,6 @@
 {
   "name": "@bainianzzz/dsh-fork-worktree",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "DeepSeek Harness plugin: fork a workspace row into a git worktree, or delete the workspace folder",
   "license": "MIT",
