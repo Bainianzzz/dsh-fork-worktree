@@ -248,9 +248,13 @@ let root = paint();
 check('confirm step shows its title', textOf(root).includes('新建 worktree 工作区'));
 check('confirm step names the path', textOf(root).includes('/tmp/repo'));
 check('confirm step explains both modes', textOf(root).includes('仅 git worktree') && textOf(root).includes('复制全部文件'));
-check('confirm step details both modes', textOf(root).includes('.gitignore') && textOf(root).includes('node_modules'));
+check('confirm step details both modes', textOf(root).includes('.gitignore') && textOf(root).includes('额外复制未跟踪文件'));
 check('confirm step has three buttons in order', JSON.stringify(buttons(root).map(textOf)) === JSON.stringify(['取消', '创建 git worktree', '复制并创建 worktree']), JSON.stringify(buttons(root).map(textOf)));
 check('confirm step has no mode radios', inputs(root).length === 0);
+const creationButtons = buttons(root).filter((node) => ['取消', '创建 git worktree', '复制并创建 worktree'].includes(textOf(node)));
+check('cancel is the ghost action', creationButtons[0]?.props.className.includes('dshForkWtActionGhost') === true, creationButtons[0]?.props.className);
+check('the git action is the primary', creationButtons[1]?.props.className.includes('dshForkWtActionPrimary') === true, creationButtons[1]?.props.className);
+check('the copy action is the outlined action', creationButtons[2]?.props.className === 'dshForkWtAction', creationButtons[2]?.props.className);
 check('opening the dialog posts nothing', calls.length === 0);
 
 /* Case 2: the git button posts the git mode, and a refusal keeps it. */

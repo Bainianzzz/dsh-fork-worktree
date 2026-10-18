@@ -75,9 +75,9 @@ window.__ModuleLoader__.load({
 			'confirm.busyGit': '正在创建 worktree…',
 			'confirm.busyCopy': '正在创建 worktree 并复制文件…',
 			'mode.git.title': '仅 git worktree',
-			'mode.git.desc': '只检出已提交的内容。未提交的修改、未跟踪的文件，以及被 .gitignore 忽略的文件（node_modules、.env 等）都不会带过去。',
+			'mode.git.desc': '只含已提交内容 · 不带未提交改动、未跟踪文件、.gitignore 忽略项',
 			'mode.copy.title': '复制全部文件',
-			'mode.copy.desc': '检出之后，再把源目录里缺少的文件复制进去：未跟踪的文件和被 .gitignore 忽略的内容（node_modules、.env 等）都会带过来；已跟踪的文件保持 HEAD 版本。文件多时需要等一会。',
+			'mode.copy.desc': '创建 git worktree，并额外复制未跟踪文件与 .gitignore 忽略项',
 			'init.title': '该目录不是 git 仓库',
 			'init.desc': '无法为 {path} 创建 worktree。可以先用 git init 把它初始化为仓库（把该目录当前的内容提交为第一个提交），再创建 worktree。',
 			'init.copyHint': '初始化之后，被 .gitignore 忽略的文件（node_modules、.env 等）也会被复制到新 worktree。',
@@ -108,9 +108,9 @@ window.__ModuleLoader__.load({
 			'confirm.busyGit': 'Creating the worktree…',
 			'confirm.busyCopy': 'Creating the worktree and copying files…',
 			'mode.git.title': 'git worktree only',
-			'mode.git.desc': 'Checks out committed content only. Uncommitted changes, untracked files, and files ignored by .gitignore (node_modules, .env, …) are left behind.',
+			'mode.git.desc': 'Committed content only · no uncommitted changes, untracked files, or .gitignore entries',
 			'mode.copy.title': 'Copy all files',
-			'mode.copy.desc': 'After the checkout, copies in every file the worktree is missing: untracked files and .gitignore-ignored content (node_modules, .env, …). Tracked files keep their HEAD version. Large folders take a while.',
+			'mode.copy.desc': 'Creates the git worktree and also copies untracked files and .gitignore entries',
 			'init.title': 'This directory is not a git repository',
 			'init.desc': "No worktree can be created for {path} yet. Initialize it as a repository first (git init, committing the directory's current content as its first commit), then create the worktree.",
 			'init.copyHint': 'Once initialized, files ignored by .gitignore (node_modules, .env, …) are copied into the new worktree too.',
@@ -154,6 +154,8 @@ window.__ModuleLoader__.load({
 .dshForkWtAction:disabled{cursor:not-allowed;opacity:.4}
 .dshForkWtActionPrimary{border-color:transparent;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
 .dshForkWtActionPrimary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
+.dshForkWtActionGhost{border-color:transparent;background:transparent;color:var(--dsw-alias-label-secondary)}
+.dshForkWtActionGhost:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
 .dshForkWtActionDanger:not(:disabled){color:var(--dsw-alias-state-error-primary)}
 .dshForkWtToast{position:fixed;top:40px;left:50%;z-index:1100;display:flex;align-items:center;gap:10px;width:max-content;max-width:min(640px,calc(100vw - 48px));padding:12px 16px;border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-toast-bg);color:var(--dsw-alias-toast-label);font-size:14px;line-height:22px;pointer-events:none;transform:translateX(-50%)}
 .dshForkWtDot{flex:none;width:8px;height:8px;border-radius:50%}
@@ -397,6 +399,18 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The single action and busy keys of each step that has one primary button.
+		 * The confirmation is absent on purpose: it draws one button per creation
+		 * mode and has two busy variants, so it never asks for a `confirm.action`
+		 * or `confirm.busy` key.
+		 */
+		const STEP_KEYS = {
+			[INITIALIZE]: { action: 'init.action', busy: 'init.busy' },
+			[REMOVE]: { action: 'remove.action', busy: 'remove.busy' },
+			[REMOVE_FORCE]: { action: 'removeForce.action', busy: 'removeForce.busy' },
+		};
+
+		/**
 		 * What each of the confirmation's two creation buttons puts into the new
 		 * worktree, in the order those buttons appear: a plain checkout, then the
 		 * checkout with the source's missing paths.
@@ -439,7 +453,9 @@ window.__ModuleLoader__.load({
 				return () => window.removeEventListener('keydown', onKeyDown);
 			}, [busy, settle]);
 			const { prefix, danger } = modePresentation(request.mode);
-			const busyText = confirming ? t(pendingCopy ? 'confirm.busyCopy' : 'confirm.busyGit') : t(`${prefix}.busy`);
+			/* Unknown steps fall back to the fork labels instead of a missing key. */
+			const stepKeys = STEP_KEYS[request.mode] ?? { action: 'confirm.gitAction', busy: 'confirm.busyGit' };
+			const busyText = confirming ? t(pendingCopy ? 'confirm.busyCopy' : 'confirm.busyGit') : t(stepKeys.busy);
 			/* The chosen creation button both decides the mode and starts the request. */
 			const run = (copy) => {
 				if (busy) return;
@@ -472,7 +488,7 @@ window.__ModuleLoader__.load({
 							'button',
 							{
 								type: 'button',
-								className: 'dshForkWtAction',
+								className: 'dshForkWtAction dshForkWtActionGhost',
 								disabled: busy,
 								onClick: () => {
 									if (!busy) settle();
@@ -515,7 +531,7 @@ window.__ModuleLoader__.load({
 										disabled: busy,
 										onClick: () => run(request.copy === true),
 									},
-									t(`${prefix}.action`),
+									t(stepKeys.action),
 								),
 					),
 				),
