@@ -26,18 +26,23 @@ dsh plugin add https://github.com/Bainianzzz/dsh-fork-worktree/releases/latest/d
 ### fork
 
 1. 点击 fork，只弹出确认框。
-2. 确认后：
-   - 目录是 git 仓库 → 在仓库同级创建 `<仓库名>-wt-<label>`，分支为 `wt/<label>`，基于当前 HEAD，并注册为新工作区。
-   - 目录不是 git 仓库 → 弹窗切换为“初始化”模式；再次确认后执行 `git init`，把目录当前内容提交为首个提交（空目录则空提交），再创建 worktree。
-3. 成功后在新工作区打开会话，并用 toast 显示路径。
+2. 确认框的「创建 worktree」只打开第二个面板，选择创建方式：
+   - **仅 git worktree**：只检出已提交的内容；未提交的修改、未跟踪文件、被 `.gitignore` 忽略的内容都留在源目录。
+   - **复制全部文件**：检出后把 worktree 缺失的文件复制进去——未跟踪文件与被忽略的内容（`node_modules`、`.env`、构建产物等）。已跟踪的文件保留 HEAD 版本，相对软链按原样保留。
+3. 第二个面板点「创建 worktree」/「复制并创建」后：
+   - 目录是 git 仓库 → 在仓库同级创建 `<仓库名>-wt-<label>`，分支为 `wt/<label>`，基于当前 HEAD；复制方式下补齐缺失文件；并注册为新工作区。
+   - 目录不是 git 仓库 → 弹窗切换为“初始化”模式（保留已选方式）；再次确认后执行 `git init`，把目录当前内容提交为首个提交（空目录则空提交），再创建 worktree。
+4. 成功后在新工作区打开会话，并用 toast 显示路径；复制方式下附带复制了多少项。
+
+复制失败时，刚创建的 worktree 与分支一并撤销。
 
 也可在该工作区的会话里执行：
 
 ```sh
-/fork-worktree [name] [--init]
+/fork-worktree [name] [--init] [--copy]
 ```
 
-省略 `name` 时使用 6 位随机 hex 作为 `label`。
+省略 `name` 时使用 6 位随机 hex 作为 `label`；`--copy` 对应上面的“复制全部文件”。
 
 ### 删除
 
