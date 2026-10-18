@@ -1,5 +1,7 @@
 # dsh-fork-worktree
 
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+
 给 dsh 侧边栏的工作区行加两个按钮（位于 `…` 和 `+` 之间）：
 
 - **fork**：基于该工作区的 git 仓库新建 worktree，注册为新工作区并在其中打开会话。
