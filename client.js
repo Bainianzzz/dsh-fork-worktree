@@ -14,13 +14,16 @@
  * before the "+", and the host hides the whole strip until the row is hovered,
  * so the buttons inherit that behavior.
  *
- * No click ever acts: each one opens the dialog first. Confirming the fork posts
- * the Workspace's directory to the fork route, which creates the worktree and
- * registers the Workspace; this half then adopts that Workspace into the Client
- * model and opens a Session in it. Confirming the removal posts to the remove
- * route; a worktree that still holds uncommitted content answers
- * `worktree-dirty`, and the dialog reopens in its force mode instead of
- * discarding work.
+ * No click ever acts: each one opens the dialog first. Confirming the fork opens
+ * a second panel that picks one of two creation modes — a plain `git worktree
+ * add` checkout, or that checkout plus every path the source has and the
+ * checkout does not (`node_modules`, `.env`, anything untracked or ignored) —
+ * and only that panel's button posts the Workspace's directory to the fork
+ * route, which creates the worktree and registers the Workspace; this half then
+ * adopts that Workspace into the Client model and opens a Session in it.
+ * Confirming the removal posts to the remove route; a worktree that still holds
+ * uncommitted content answers `worktree-dirty`, and the dialog reopens in its
+ * force mode instead of discarding work.
  *
  * Controls are hand-written against theme tokens; the markup and CSS follow the
  * host's `iconButton`, `Modal`, `Toast`, and destructive `Button` and share only
@@ -53,8 +56,9 @@ window.__ModuleLoader__.load({
 		/** How long a toast stays before it dismisses itself, matching the host's banner. */
 		const TOAST_HOLD_MS = 3200;
 
-		/** Dialog modes: confirmations, and the two questions that follow a refusal. */
+		/** Dialog steps: the two fork questions, and the two that follow a refusal. */
 		const CONFIRM = 'confirm';
+		const MODE = 'mode';
 		const INITIALIZE = 'initialize';
 		const REMOVE = 'remove';
 		const REMOVE_FORCE = 'remove-force';
@@ -69,8 +73,20 @@ window.__ModuleLoader__.load({
 			'confirm.desc': '将基于 {path} 所在的仓库创建一个新的 git worktree，并把该 worktree 注册为一个新的 dsh 工作区。',
 			'confirm.action': '创建 worktree',
 			'confirm.busy': '正在创建 worktree…',
+			'mode.title': '选择创建方式',
+			'mode.desc': '新 worktree 里放什么内容。两种方式都会先把已提交的内容检出到新 worktree。',
+			'mode.git.title': '仅 git worktree',
+			'mode.git.desc': '只检出已提交的内容。未提交的修改、未跟踪的文件，以及被 .gitignore 忽略的文件（node_modules、.env 等）都不会带过去。',
+			'mode.copy.title': '复制全部文件',
+			'mode.copy.desc': '检出之后，再把源目录里缺少的文件复制进去：未跟踪的文件和被 .gitignore 忽略的内容（node_modules、.env 等）都会带过来；已跟踪的文件保持 HEAD 版本。文件多时需要等一会。',
+			'mode.gitAction': '创建 worktree',
+			'mode.copyAction': '复制并创建',
+			'mode.busyGit': '正在创建 worktree…',
+			'mode.busyCopy': '正在创建 worktree 并复制文件…',
+			'mode.exit': '退出',
 			'init.title': '该目录不是 git 仓库',
 			'init.desc': '无法为 {path} 创建 worktree。可以先用 git init 把它初始化为仓库（把该目录当前的内容提交为第一个提交），再创建 worktree。',
+			'init.copyHint': '初始化之后，被 .gitignore 忽略的文件（node_modules、.env 等）也会被复制到新 worktree。',
 			'init.action': '初始化并创建 worktree',
 			'init.busy': '正在初始化并创建 worktree…',
 			'remove.title': '删除工作区文件夹',
@@ -83,6 +99,7 @@ window.__ModuleLoader__.load({
 			'removeForce.busy': '正在强制删除…',
 			'cancel': '取消',
 			'toast.forked': '已创建 worktree 工作区：{path}',
+			'toast.forkedCopied': '已创建 worktree 工作区：{path}（复制了 {count} 项）',
 			'toast.forkFailed': '创建 worktree 失败：{message}',
 			'toast.removed': '已删除工作区文件夹：{path}',
 			'toast.removeFailed': '删除失败：{message}',
@@ -94,8 +111,20 @@ window.__ModuleLoader__.load({
 			'confirm.desc': 'A new git worktree will be created from the repository that owns {path}, and that worktree will be registered as a new dsh workspace.',
 			'confirm.action': 'Create worktree',
 			'confirm.busy': 'Creating the worktree…',
+			'mode.title': 'Choose a creation mode',
+			'mode.desc': 'What the new worktree starts with. Both modes check the committed content out first.',
+			'mode.git.title': 'git worktree only',
+			'mode.git.desc': 'Checks out committed content only. Uncommitted changes, untracked files, and files ignored by .gitignore (node_modules, .env, …) are left behind.',
+			'mode.copy.title': 'Copy all files',
+			'mode.copy.desc': 'After the checkout, copies in every file the worktree is missing: untracked files and .gitignore-ignored content (node_modules, .env, …). Tracked files keep their HEAD version. Large folders take a while.',
+			'mode.gitAction': 'Create worktree',
+			'mode.copyAction': 'Copy and create',
+			'mode.busyGit': 'Creating the worktree…',
+			'mode.busyCopy': 'Creating the worktree and copying files…',
+			'mode.exit': 'Exit',
 			'init.title': 'This directory is not a git repository',
 			'init.desc': "No worktree can be created for {path} yet. Initialize it as a repository first (git init, committing the directory's current content as its first commit), then create the worktree.",
+			'init.copyHint': 'Once initialized, files ignored by .gitignore (node_modules, .env, …) are copied into the new worktree too.',
 			'init.action': 'Initialize and create worktree',
 			'init.busy': 'Initializing and creating the worktree…',
 			'remove.title': 'Delete the workspace folder',
@@ -108,6 +137,7 @@ window.__ModuleLoader__.load({
 			'removeForce.busy': 'Deleting anyway…',
 			'cancel': 'Cancel',
 			'toast.forked': 'Created a worktree workspace: {path}',
+			'toast.forkedCopied': 'Created a worktree workspace: {path} ({count} items copied)',
 			'toast.forkFailed': 'Creating the worktree failed: {message}',
 			'toast.removed': 'Deleted the workspace folder: {path}',
 			'toast.removeFailed': 'Deleting the folder failed: {message}',
@@ -120,11 +150,20 @@ window.__ModuleLoader__.load({
 .dshForkWtButton:disabled{opacity:.5;cursor:default}
 .dshForkWtMask{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;pointer-events:auto}
 .dshForkWtMask::after{content:'';position:absolute;inset:0;background:var(--dsw-alias-bg-mask-1);backdrop-filter:var(--dsw-mask-blur)}
-.dshForkWtDialog{box-sizing:border-box;position:relative;z-index:1;display:flex;flex-direction:column;gap:16px;width:min(420px,100%);max-height:100%;overflow:auto;padding:22px 24px 24px;border-radius:var(--dsw-radius-panel);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary)}
+.dshForkWtDialog{box-sizing:border-box;position:relative;z-index:1;display:flex;flex-direction:column;gap:16px;width:min(480px,100%);max-height:100%;overflow:auto;padding:22px 24px 24px;border-radius:var(--dsw-radius-panel);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary)}
 .dshForkWtDialog:focus{outline:none}
 .dshForkWtTitle{margin:0;font-size:16px;line-height:24px;font-weight:500}
 .dshForkWtDesc{margin:0;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
 .dshForkWtStatus{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.dshForkWtOptions{display:flex;flex-direction:column;gap:8px}
+.dshForkWtOption{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);cursor:pointer}
+.dshForkWtOption:hover:not(.dshForkWtOptionDisabled){background:var(--dsw-alias-interactive-bg-hover)}
+.dshForkWtOptionActive{border-color:var(--dsw-alias-button-primary-fill);background:var(--dsw-alias-interactive-bg-hover)}
+.dshForkWtOptionDisabled{cursor:not-allowed;opacity:.6}
+.dshForkWtOptionInput{flex:none;margin:4px 0 0;accent-color:var(--dsw-alias-button-primary-fill)}
+.dshForkWtOptionText{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dshForkWtOptionTitle{font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary)}
+.dshForkWtOptionDesc{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
 .dshForkWtActions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
 .dshForkWtAction{box-sizing:border-box;height:36px;padding:0 14px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:14px;line-height:22px;cursor:pointer}
 .dshForkWtAction:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
@@ -346,7 +385,7 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** The one dialog: a confirmation, and the follow-up question after a refusal. */
+		/** The one dialog: a confirmation, the mode question, and the questions after a refusal. */
 		function WorkspaceActionDialog({ useWorkspaceRequest, settleWorkspaceRequest, confirmWorkspaceRequest, t }) {
 			const request = useWorkspaceRequest((pending) => pending);
 			if (request === null) return null;
@@ -359,9 +398,11 @@ window.__ModuleLoader__.load({
 			});
 		}
 
-		/** Prefix of the dictionary keys driving one mode, and whether it destroys. */
+		/** Prefix of the dictionary keys driving one step, and whether it destroys. */
 		function modePresentation(mode) {
 			switch (mode) {
+				case MODE:
+					return { prefix: 'mode', danger: false };
 				case INITIALIZE:
 					return { prefix: 'init', danger: false };
 				case REMOVE:
@@ -373,10 +414,51 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** One pending request's dialog; its in-flight state dies with it. */
+		/**
+		 * The two creation modes the fork asks about, in the order they are shown:
+		 * a plain checkout, then the checkout with the source's missing paths.
+		 */
+		function ModeOptions({ request, copy, busy, onSelect, t }) {
+			const options = [
+				{ value: false, title: 'mode.git.title', desc: 'mode.git.desc' },
+				{ value: true, title: 'mode.copy.title', desc: 'mode.copy.desc' },
+			];
+			return h(
+				'div',
+				{ className: 'dshForkWtOptions', role: 'radiogroup', 'aria-label': t('mode.title') },
+				options.map((option) =>
+					h(
+						'label',
+						{
+							key: option.value ? 'copy' : 'git',
+							className: `dshForkWtOption${option.value === copy ? ' dshForkWtOptionActive' : ''}${busy ? ' dshForkWtOptionDisabled' : ''}`,
+						},
+						h('input', {
+							type: 'radio',
+							className: 'dshForkWtOptionInput',
+							name: `dshForkWtMode-${request.workspaceId}`,
+							checked: option.value === copy,
+							disabled: busy,
+							onChange: () => onSelect(option.value),
+						}),
+						h(
+							'span',
+							{ className: 'dshForkWtOptionText' },
+							h('span', { className: 'dshForkWtOptionTitle' }, t(option.title)),
+							h('span', { className: 'dshForkWtOptionDesc' }, t(option.desc)),
+						),
+					),
+				),
+			);
+		}
+
+		/** One pending request's dialog; its in-flight and copy-choice state die with it. */
 		function WorkspaceActionDialogBody({ request, settle, confirm, t }) {
 			const [busy, setBusy] = React.useState(false);
+			/* The fork's chosen mode; the dialog's first step is the only place that sets it. */
+			const [copy, setCopy] = React.useState(request.copy === true);
 			const primary = React.useRef(null);
+			const choosing = request.mode === MODE;
 			React.useEffect(() => {
 				primary.current?.focus();
 			}, []);
@@ -388,6 +470,8 @@ window.__ModuleLoader__.load({
 				return () => window.removeEventListener('keydown', onKeyDown);
 			}, [busy, settle]);
 			const { prefix, danger } = modePresentation(request.mode);
+			const busyText = choosing ? t(copy ? 'mode.busyCopy' : 'mode.busyGit') : t(`${prefix}.busy`);
+			const actionText = choosing ? t(copy ? 'mode.copyAction' : 'mode.gitAction') : t(`${prefix}.action`);
 			return h(
 				'div',
 				{ className: 'dshForkWtMask' },
@@ -403,7 +487,9 @@ window.__ModuleLoader__.load({
 					},
 					h('p', { className: 'dshForkWtTitle' }, t(`${prefix}.title`)),
 					h('p', { className: 'dshForkWtDesc' }, t(`${prefix}.desc`, { path: request.source })),
-					busy ? h('p', { className: 'dshForkWtStatus', role: 'status' }, t(`${prefix}.busy`)) : null,
+					request.mode === INITIALIZE && copy ? h('p', { className: 'dshForkWtDesc' }, t('init.copyHint')) : null,
+					choosing ? h(ModeOptions, { request, copy, busy, onSelect: setCopy, t }) : null,
+					busy ? h('p', { className: 'dshForkWtStatus', role: 'status' }, busyText) : null,
 					h(
 						'div',
 						{ className: 'dshForkWtActions' },
@@ -417,7 +503,7 @@ window.__ModuleLoader__.load({
 									if (!busy) settle();
 								},
 							},
-							t('cancel'),
+							t(choosing ? 'mode.exit' : 'cancel'),
 						),
 						h(
 							'button',
@@ -427,11 +513,17 @@ window.__ModuleLoader__.load({
 								className: `dshForkWtAction ${danger ? 'dshForkWtActionDanger' : 'dshForkWtActionPrimary'}`,
 								disabled: busy,
 								onClick: () => {
+									if (busy) return;
+									/* The first step only opens the mode question; it never posts. */
+									if (request.mode === CONFIRM) {
+										confirm(request.workspaceId, CONFIRM, copy);
+										return;
+									}
 									setBusy(true);
-									Promise.resolve(confirm(request.workspaceId, request.mode)).finally(() => setBusy(false));
+									Promise.resolve(confirm(request.workspaceId, request.mode, copy)).finally(() => setBusy(false));
 								},
 							},
-							t(`${prefix}.action`),
+							actionText,
 						),
 					),
 				),
@@ -448,6 +540,14 @@ window.__ModuleLoader__.load({
 			}, [toast === null ? 0 : toast.seq]);
 			if (toast === null) return null;
 			const removed = toast.action !== FORK;
+			const copied = toast.kind === 'ok' && !removed && toast.copied > 0;
+			const text =
+				toast.kind === 'ok'
+					? t(copied ? 'toast.forkedCopied' : removed ? 'toast.removed' : 'toast.forked', {
+							path: toast.path,
+							...(copied ? { count: toast.copied } : {}),
+						})
+					: t(removed ? 'toast.removeFailed' : 'toast.forkFailed', { message: toast.message });
 			return h(
 				React.Fragment,
 				null,
@@ -458,13 +558,7 @@ window.__ModuleLoader__.load({
 					h('span', {
 						className: `dshForkWtDot ${toast.kind === 'ok' ? 'dshForkWtDotOk' : 'dshForkWtDotError'}`,
 					}),
-					h(
-						'span',
-						{ className: 'dshForkWtToastText' },
-						toast.kind === 'ok'
-							? t(removed ? 'toast.removed' : 'toast.forked', { path: toast.path })
-							: t(removed ? 'toast.removeFailed' : 'toast.forkFailed', { message: toast.message }),
-					),
+					h('span', { className: 'dshForkWtToastText' }, text),
 				),
 			);
 		}
@@ -507,6 +601,8 @@ window.__ModuleLoader__.load({
 
 			/**
 			 * Create the worktree workspace for one Workspace row.
+			 * @param options - `init` for the not-a-repository retry, and `copy` for
+			 * the creation mode the mode step selected.
 			 * @returns `'dialog'` when the caller must keep the dialog open in its
 			 * initialize mode, `'settled'` when the outcome was reported.
 			 */
@@ -516,14 +612,15 @@ window.__ModuleLoader__.load({
 					notify({ kind: 'error', action: FORK, message: `unknown workspace ${workspaceId}` });
 					return 'settled';
 				}
-				const { outcome, failure } = await post(FORK_ROUTE, { source, init: options.init === true });
+				const copy = options.copy === true;
+				const { outcome, failure } = await post(FORK_ROUTE, { source, init: options.init === true, mode: copy ? 'copy' : 'git' });
 				if (failure !== undefined) {
 					notify({ kind: 'error', action: FORK, message: failure });
 					return 'settled';
 				}
 				if (outcome?.ok !== true) {
 					if (outcome?.code === 'not-a-git-repo' && options.init !== true) {
-						request.set({ workspaceId, source: outcome.path ?? source, mode: INITIALIZE });
+						request.set({ workspaceId, source: outcome.path ?? source, mode: INITIALIZE, copy });
 						return 'dialog';
 					}
 					notify({ kind: 'error', action: FORK, message: outcome?.message ?? 'the fork route reported no outcome' });
@@ -532,7 +629,7 @@ window.__ModuleLoader__.load({
 				/* The Host already registered it; this adopts the same record locally. */
 				const workspace = await ctx.workspaces.create({ path: outcome.path });
 				ctx.uiWorkspace.startSession(workspace.workspaceId);
-				notify({ kind: 'ok', action: FORK, path: outcome.path });
+				notify({ kind: 'ok', action: FORK, path: outcome.path, copied: typeof outcome.copied === 'number' ? outcome.copied : 0 });
 				return 'settled';
 			};
 
@@ -580,7 +677,7 @@ window.__ModuleLoader__.load({
 									notify({ kind: 'error', action: FORK, message: `unknown workspace ${workspaceId}` });
 									return;
 								}
-								request.set({ workspaceId, source, mode: CONFIRM });
+								request.set({ workspaceId, source, mode: CONFIRM, copy: false });
 							},
 							removeWorkspace: (workspaceId) => {
 								const source = pathOf(workspaceId);
@@ -604,13 +701,24 @@ window.__ModuleLoader__.load({
 							settleWorkspaceRequest: () => {
 								request.set(null);
 							},
-							confirmWorkspaceRequest: async (workspaceId, mode) => {
-								const run =
-									mode === REMOVE || mode === REMOVE_FORCE
-										? () => remove(workspaceId, { force: mode === REMOVE_FORCE })
-										: () => fork(workspaceId, { init: mode === INITIALIZE });
+							confirmWorkspaceRequest: async (workspaceId, step, copy) => {
+								/* The confirmation step only opens the mode question; nothing is created yet. */
+								if (step === CONFIRM) {
+									const source = pathOf(workspaceId);
+									if (source === undefined) {
+										notify({ kind: 'error', action: FORK, message: `unknown workspace ${workspaceId}` });
+										request.set(null);
+										return;
+									}
+									request.set({ workspaceId, source, mode: MODE, copy: copy === true });
+									return;
+								}
+								const removing = step === REMOVE || step === REMOVE_FORCE;
+								const run = removing
+									? () => remove(workspaceId, { force: step === REMOVE_FORCE })
+									: () => fork(workspaceId, { init: step === INITIALIZE, copy: copy === true });
 								const outcome = await run().catch((error) => {
-									report(mode === REMOVE || mode === REMOVE_FORCE ? REMOVE : FORK)(error);
+									report(removing ? REMOVE : FORK)(error);
 									return 'settled';
 								});
 								/* Only a refusal keeps the dialog: it reopens stronger. */

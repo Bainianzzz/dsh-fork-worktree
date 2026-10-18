@@ -10,7 +10,7 @@
  * Run with `node verify-host.mjs`. The scratch directory is removed at the end.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,6 +157,81 @@ check('fork route reports a missing directory', missingRoute.status === 200 && m
 const okRoute = await callRoute(fork, { body: JSON.stringify({ source: repo, name: 'route' }) });
 check('fork route forks', okRoute.status === 200 && okRoute.json.ok === true, JSON.stringify(okRoute.json));
 check('fork route reports path, branch, and workspace', okRoute.json.path === join(root, 'scratch-repo-wt-route') && okRoute.json.branch === 'wt/route' && typeof okRoute.json.workspaceId === 'string', JSON.stringify(okRoute.json));
+
+/* Case 5b: copy mode — the checkout plus every path it does not have. */
+const copyRepo = join(root, 'copy-repo');
+mkdirSync(join(copyRepo, 'src'), { recursive: true });
+writeFileSync(join(copyRepo, '.gitignore'), 'node_modules\n.env\nbuild\n');
+writeFileSync(join(copyRepo, 'src', 'tracked.ts'), 'HEAD\n');
+git(['init', '-b', 'main'], copyRepo);
+git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'add', '.'], copyRepo);
+git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-m', 'initial'], copyRepo);
+/* After the commit: an uncommitted edit, an untracked sibling, and ignored content. */
+writeFileSync(join(copyRepo, 'src', 'tracked.ts'), 'WORKING\n');
+writeFileSync(join(copyRepo, 'src', 'untracked.ts'), 'UNTRACKED\n');
+mkdirSync(join(copyRepo, 'node_modules', 'dep'), { recursive: true });
+writeFileSync(join(copyRepo, 'node_modules', 'dep', 'index.js'), 'DEP\n');
+writeFileSync(join(copyRepo, '.env'), 'SECRET=1\n');
+mkdirSync(join(copyRepo, 'build'), { recursive: true });
+writeFileSync(join(copyRepo, 'build', 'out.js'), 'BUILT\n');
+/* A pnpm-style relative workspace link, inside the ignored tree. */
+symlinkSync('../src', join(copyRepo, 'node_modules', 'tracked-link'));
+
+const copyFork = await createWorktreeFork(ctx, { source: copyRepo, name: 'copymode', mode: 'copy' });
+check('copy mode creates the fork', copyFork.kind === 'success', copyFork.text);
+check('copy mode keeps tracked files at HEAD', readFileSync(join(copyFork.path, 'src', 'tracked.ts'), 'utf8') === 'HEAD\n');
+check('copy mode brings untracked files', readFileSync(join(copyFork.path, 'src', 'untracked.ts'), 'utf8') === 'UNTRACKED\n');
+check('copy mode brings ignored folders', readFileSync(join(copyFork.path, 'node_modules', 'dep', 'index.js'), 'utf8') === 'DEP\n');
+check('copy mode brings ignored files', readFileSync(join(copyFork.path, '.env'), 'utf8') === 'SECRET=1\n');
+check('copy mode brings ignored build output', readFileSync(join(copyFork.path, 'build', 'out.js'), 'utf8') === 'BUILT\n');
+check('copy mode leaves the source .git behind', !existsSync(join(copyFork.path, '.git', 'objects')));
+check('copy mode keeps relative links relative', readlinkSync(join(copyFork.path, 'node_modules', 'tracked-link')) === '../src', readlinkSync(join(copyFork.path, 'node_modules', 'tracked-link')));
+check('a copied relative link resolves inside the new worktree', readFileSync(join(copyFork.path, 'node_modules', 'tracked-link', 'tracked.ts'), 'utf8') === 'HEAD\n');
+check('copy mode counts what it copied', copyFork.kind === 'success' && copyFork.copied >= 5, String(copyFork.copied));
+check('copy mode reports its mode', copyFork.kind === 'success' && copyFork.mode === 'copy' && copyFork.text.includes('mode: git worktree plus'), copyFork.text);
+check('a copied worktree keeps its branch', copyFork.kind === 'success' && git(['branch', '--list', copyFork.branch], copyRepo).includes(copyFork.branch));
+
+const gitFork = await createWorktreeFork(ctx, { source: copyRepo, name: 'gitmode', mode: 'git' });
+check('git mode copies nothing', gitFork.kind === 'success' && gitFork.copied === 0, String(gitFork.copied));
+check('git mode keeps ignored folders out', !existsSync(join(gitFork.path, 'node_modules')));
+check('git mode keeps untracked files out', !existsSync(join(gitFork.path, 'src', 'untracked.ts')));
+check('git mode keeps the .gitignore in the checkout', existsSync(join(gitFork.path, '.gitignore')));
+
+/* Case 5c: the copy mode of the fork route, and its rejection of anything else. */
+const copyRouteFork = await callRoute(fork, { body: JSON.stringify({ source: copyRepo, name: 'route-copy', mode: 'copy' }) });
+check('fork route honours the copy mode', copyRouteFork.status === 200 && copyRouteFork.json.ok === true && copyRouteFork.json.mode === 'copy', JSON.stringify(copyRouteFork.json));
+check('fork route reports the copied count', copyRouteFork.json.copied > 0, String(copyRouteFork.json.copied));
+const defaultModeFork = await callRoute(fork, { body: JSON.stringify({ source: copyRepo, name: 'route-default' }) });
+check('fork route defaults to the git mode', defaultModeFork.json.ok === true && defaultModeFork.json.mode === 'git' && defaultModeFork.json.copied === 0, JSON.stringify(defaultModeFork.json));
+const badModeFork = await callRoute(fork, { body: JSON.stringify({ source: copyRepo, mode: 'everything' }) });
+check('fork route rejects an unknown mode', badModeFork.status === 400 && badModeFork.json.code === 'invalid-request', JSON.stringify(badModeFork.json));
+
+/* Case 5d: initialization and the copy mode together. */
+const initCopyDir = join(root, 'plain-copy');
+mkdirSync(join(initCopyDir, 'cache'), { recursive: true });
+writeFileSync(join(initCopyDir, '.gitignore'), 'cache\n');
+writeFileSync(join(initCopyDir, 'notes.txt'), 'x\n');
+writeFileSync(join(initCopyDir, 'cache', 'blob.bin'), 'CACHE\n');
+const initCopy = await createWorktreeFork(ctx, { source: initCopyDir, name: 'init-copy', init: true, mode: 'copy' });
+check('init plus copy forks', initCopy.kind === 'success', initCopy.text);
+check('init plus copy carries the ignored content', initCopy.kind === 'success' && readFileSync(join(initCopy.path, 'cache', 'blob.bin'), 'utf8') === 'CACHE\n');
+check('init plus copy keeps the committed content at HEAD', initCopy.kind === 'success' && readFileSync(join(initCopy.path, 'notes.txt'), 'utf8') === 'x\n');
+
+/* Case 5e: a copy that cannot finish leaves no half-made worktree behind. */
+const unreadableDir = join(root, 'copy-unreadable');
+mkdirSync(join(unreadableDir, 'secret'), { recursive: true });
+writeFileSync(join(unreadableDir, 'README.md'), '# scratch\n');
+git(['init', '-b', 'main'], unreadableDir);
+git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'add', '.'], unreadableDir);
+git(['-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-m', 'initial'], unreadableDir);
+writeFileSync(join(unreadableDir, 'secret', 'locked.txt'), 'x\n');
+chmodSync(join(unreadableDir, 'secret', 'locked.txt'), 0o000);
+const failedCopy = await createWorktreeFork(ctx, { source: unreadableDir, name: 'noperm', mode: 'copy' });
+check('an unreadable copy reports copy-failed', failedCopy.kind === 'error' && failedCopy.code === 'copy-failed', JSON.stringify(failedCopy));
+check('a failed copy leaves no worktree directory', !existsSync(join(root, 'copy-unreadable-wt-noperm')));
+check('a failed copy leaves no branch', !git(['branch', '--list', 'wt/noperm'], unreadableDir).includes('wt/noperm'));
+check('a failed copy leaves no registration', registry.rows.every((row) => row.path !== join(root, 'copy-unreadable-wt-noperm')));
+chmodSync(join(unreadableDir, 'secret', 'locked.txt'), 0o600);
 
 /* Case 6: removal of a clean worktree, and of a plain directory. */
 const cleanFork = await createWorktreeFork(ctx, { source: repo, name: 'cleanup', init: false });

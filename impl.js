@@ -7,6 +7,13 @@
  * creates a git worktree of the repository that owns it, and registers the
  * worktree as a durable DSH Workspace.
  *
+ * The worktree starts as `git worktree add` leaves it — HEAD only — so a
+ * request can also select the copy mode, which then fills in every path the
+ * checkout is missing from the directory it was made from: untracked files and
+ * `.gitignore`d content such as `node_modules` or `.env`. Tracked files keep
+ * their HEAD version, so the new worktree never starts with someone's
+ * uncommitted edits.
+ *
  * A second route, {@link removeWorkspaceFolder}, does the inverse for the
  * Client's trash button: it deletes a Workspace's directory (through
  * `git worktree remove` when the directory is a linked worktree, so the
@@ -27,7 +34,8 @@
  */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, rmSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, rmSync, statSync } from 'node:fs';
+import { cp, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -59,10 +67,14 @@ const MAX_BODY_BYTES = 64 * 1024;
 /** The infix between a repository name and a fork label. */
 const FORK_INFIX = '-wt-';
 
+/** Creation modes: the checkout git produces, or that checkout plus what it is missing. */
+export const MODE_GIT = 'git';
+export const MODE_COPY = 'copy';
+
 /** A generated label: six lowercase hex characters. */
 const GENERATED_LABEL = /^[0-9a-f]{6}$/u;
 
-const USAGE = `Usage: /${COMMAND} [<name>] [--init]`;
+const USAGE = `Usage: /${COMMAND} [<name>] [--init] [--copy]`;
 
 const execFileAsync = promisify(execFile);
 
@@ -154,11 +166,69 @@ function sessionCwd(agent) {
 	return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
 }
 
+/** Whether a path is a byte-for-byte reproducible kind: a file, a directory, or a link. */
+function isCopyable(path) {
+	try {
+		const info = lstatSync(path);
+		return info.isFile() || info.isDirectory() || info.isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Copy every path `target` is missing from `root`, the checkout it was made from.
+ *
+ * `git worktree add` writes the committed tree and nothing else, so forking a
+ * working directory that carries dependencies and local configuration leaves a
+ * checkout nobody can build in. This walks the source's top level and copies
+ * only paths that are absent: an existing path is one git already placed, and it
+ * keeps its HEAD version — which leaves exactly the untracked and ignored
+ * content. The source's own `.git` never travels; it is the other checkout's
+ * metadata.
+ *
+ * Node's `cp` merges into an existing directory and, with `force: false` and
+ * `errorOnExist: false`, leaves existing files alone instead of failing, so one
+ * call per top-level entry is enough. `preserveTimestamps` keeps mtime-reading
+ * build caches (tsbuildinfo, bundler caches) from treating every copied file as
+ * rebuilt. `verbatimSymlinks` is load-bearing: without it `cp` rewrites every
+ * relative link to the absolute path it resolved to, so a pnpm-style
+ * `node_modules/foo -> ../packages/foo` would point back at the source checkout
+ * instead of the new worktree's own package.
+ *
+ * @param root - the checkout the worktree was created from.
+ * @param target - the new worktree.
+ * @returns how many paths were copied.
+ */
+async function copyMissingFrom(root, target) {
+	let copied = 0;
+	for (const entry of await readdir(root, { withFileTypes: true })) {
+		if (entry.name === '.git') continue;
+		await cp(join(root, entry.name), join(target, entry.name), {
+			recursive: entry.isDirectory(),
+			force: false,
+			errorOnExist: false,
+			preserveTimestamps: true,
+			verbatimSymlinks: true,
+			/* Existing paths belong to git; only missing ones are counted or inspected. */
+			filter: (from, to) => {
+				if (existsSync(to)) return true;
+				if (!isCopyable(from)) return false;
+				copied += 1;
+				return true;
+			},
+		});
+	}
+	return copied;
+}
+
 /**
  * Create one worktree of `source`'s repository and register it as a Workspace.
  *
  * @param ctx - Host context owning the Workspace registry.
- * @param request - source directory, optional label, and whether to initialize.
+ * @param request - source directory, optional label, whether to initialize, and
+ * the creation mode: `git` (checkout only) or `copy` (checkout plus every path
+ * the source has and the checkout does not).
  * @returns an outcome carrying either the new path and Workspace, or a stable code.
  */
 export async function createWorktreeFork(ctx, request) {
@@ -166,10 +236,11 @@ export async function createWorktreeFork(ctx, request) {
 	if (typeof source !== 'string' || source === '') return { kind: 'error', code: 'no-source', text: 'no workspace directory was given' };
 	if (!existsSync(source)) return { kind: 'error', code: 'source-missing', text: `workspace directory does not exist: ${source}` };
 	if (!statSync(source).isDirectory()) return { kind: 'error', code: 'source-not-directory', text: `workspace path is not a directory: ${source}` };
+	const mode = request.mode === MODE_COPY ? MODE_COPY : MODE_GIT;
 
 	const repository = await repositoryRoot(source, request.init === true);
 	if (!repository.ok) {
-		if (repository.notARepository === true) return { kind: 'error', code: 'not-a-git-repo', text: `${NOT_A_REPO} ${source}` };
+		if (repository.notARepository === true) return { kind: 'error', code: 'not-a-git-repo', path: source, text: `${NOT_A_REPO} ${source}` };
 		return { kind: 'error', code: 'git-failed', text: repository.message };
 	}
 
@@ -181,6 +252,28 @@ export async function createWorktreeFork(ctx, request) {
 
 	const added = await git(['worktree', 'add', '-b', branch, target, 'HEAD'], source);
 	if (!added.ok) return { kind: 'error', code: 'git-failed', text: `git worktree add failed: ${added.message}` };
+
+	let copied = 0;
+	if (mode === MODE_COPY) {
+		try {
+			copied = await copyMissingFrom(root, target);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			/* The copy runs before registration, so a failure must not strand a worktree nobody owns. */
+			const cleaned = await git(['worktree', 'remove', '--force', target], root);
+			if (!cleaned.ok) {
+				return {
+					kind: 'error',
+					code: 'copy-failed',
+					path: target,
+					branch,
+					text: `worktree created at ${target}, but copying the source content failed (${detail}) and the partial worktree could not be removed: ${cleaned.message}`,
+				};
+			}
+			await git(['branch', '--delete', '--force', branch], root);
+			return { kind: 'error', code: 'copy-failed', text: `copying the source content failed, so the worktree was removed: ${detail}` };
+		}
+	}
 
 	let workspace;
 	try {
@@ -198,6 +291,8 @@ export async function createWorktreeFork(ctx, request) {
 		kind: 'success',
 		path: target,
 		branch,
+		mode,
+		copied,
 		workspaceId: workspace.id,
 		text: [
 			target,
@@ -205,6 +300,7 @@ export async function createWorktreeFork(ctx, request) {
 			`branch: ${branch}`,
 			`source: ${root}`,
 			`repository: ${repository.initialized ? 'initialized' : 'existing'}`,
+			`mode: ${mode === MODE_COPY ? `git worktree plus ${String(copied)} copied paths` : 'git worktree only'}`,
 			`workspace: ${workspace.path}`,
 		].join('\n'),
 	};
@@ -283,20 +379,25 @@ export async function removeWorkspaceFolder(ctx, request) {
 	return { kind: 'success', path: source, method: 'removed-directory', text: `removed directory ${source}` };
 }
 
-/** Parse `[<name>] [--init]`, rejecting anything else loudly enough to correct. */
+/** Parse `[<name>] [--init] [--copy]`, rejecting anything else loudly enough to correct. */
 function parseArguments(rawInput) {
 	let name;
 	let init = false;
+	let mode = MODE_GIT;
 	for (const token of rawInput.trim().split(/\s+/u).filter((part) => part !== '')) {
 		if (token === '--init') {
 			init = true;
+			continue;
+		}
+		if (token === '--copy') {
+			mode = MODE_COPY;
 			continue;
 		}
 		if (token.startsWith('-')) return { error: `unknown option "${token}".\n${USAGE}` };
 		if (name !== undefined) return { error: `at most one name is accepted.\n${USAGE}` };
 		name = token;
 	}
-	return { name, init };
+	return { name, init, mode };
 }
 
 /** Whether `dir` is the checkout of a linked worktree rather than a repository root. */
@@ -469,8 +570,13 @@ function invalidRequest(message) {
 }
 
 /**
- * The route the Client's fork button calls: `{ source, name?, init? }` in,
- * `{ ok: true, path, workspaceId, branch }` or `{ ok: false, code, message }` out.
+ * The route the Client's fork button calls: `{ source, name?, init?, mode? }` in,
+ * `{ ok: true, path, workspaceId, branch, mode, copied }` or
+ * `{ ok: false, code, message }` out.
+ *
+ * `mode` is `git` (the default, a plain `git worktree add` checkout) or `copy`
+ * (the same checkout, plus every path the source has and it does not). Anything
+ * else is a client bug, rejected rather than silently downgraded.
  *
  * @param ctx - Host context owning the registry and the trust check.
  * @returns the Node request handler.
@@ -478,8 +584,11 @@ function invalidRequest(message) {
 export function forkRoute(ctx) {
 	return jsonPost(ctx, async (payload) => {
 		if (typeof payload.source !== 'string' || payload.source === '') return invalidRequest('source must be a non-empty path');
+		const mode = payload.mode === undefined ? MODE_GIT : payload.mode;
+		if (mode !== MODE_GIT && mode !== MODE_COPY) return invalidRequest(`mode must be "${MODE_GIT}" or "${MODE_COPY}"`);
 		const outcome = await createWorktreeFork(ctx, {
 			source: payload.source,
+			mode,
 			...(typeof payload.name === 'string' && payload.name !== '' ? { name: payload.name } : {}),
 			init: payload.init === true,
 		});
@@ -490,6 +599,8 @@ export function forkRoute(ctx) {
 					ok: true,
 					path: outcome.path,
 					branch: outcome.branch,
+					mode: outcome.mode,
+					copied: outcome.copied,
 					workspaceId: outcome.workspaceId,
 					text: outcome.text,
 				},
@@ -501,7 +612,7 @@ export function forkRoute(ctx) {
 				ok: false,
 				code: outcome.code,
 				message: outcome.text,
-				...(outcome.code === 'not-a-git-repo' ? { path: payload.source } : {}),
+				...(outcome.path === undefined ? {} : { path: outcome.path }),
 			},
 		};
 	});
@@ -534,7 +645,8 @@ export function removeRoute(ctx) {
 
 /**
  * Register the human command the same operation serves: a second caller beside
- * the Client button, typed into the composer of the workspace to fork.
+ * the Client button, typed into the composer of the workspace to fork. `--copy`
+ * selects the creation mode the dialog offers as its second choice.
  *
  * @param ctx - Host context carrying the command registry.
  */
@@ -542,7 +654,7 @@ export function apply(ctx) {
 	ctx.commands.register({
 		name: COMMAND,
 		description: "Create a git worktree of this Session's workspace and register it as a new workspace",
-		input: { hint: '[<name>] [--init]' },
+		input: { hint: '[<name>] [--init] [--copy]' },
 		handler: async (invocation) => {
 			const parsed = parseArguments(invocation.rawInput);
 			if (parsed.error !== undefined) return { kind: 'error', text: parsed.error };
@@ -550,6 +662,7 @@ export function apply(ctx) {
 			if (source === undefined) return { kind: 'error', text: 'this Session records no working directory' };
 			const outcome = await createWorktreeFork(ctx, {
 				source,
+				mode: parsed.mode,
 				...(parsed.name === undefined ? {} : { name: parsed.name }),
 				init: parsed.init,
 			});
